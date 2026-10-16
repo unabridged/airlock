@@ -1,0 +1,49 @@
+{
+  "ssh_config": "~/.ssh/config",
+  "instructions": "Airlock is the ONLY sanctioned path to remote hosts: never run ssh/scp/sftp, aws ecs execute-command, or a project's bin/shell-style connection helper directly from Bash, and never reconstruct connection details from Capistrano configs, deploy scripts, or ~/.ssh/config — pick a target from list_targets instead. Use Airlock proactively while debugging a ticket whenever up-to-date staging or production data would help and a local database dump cannot provide it (live record state, counts, feature flags, recent events). Prefer read-only investigation. Every command is human-approved in a native overlay; a denial may carry feedback — adjust and resend.",
+  "targets": {
+    "myapp-staging-shell": {
+      "description": "MyApp staging shell (myapp-staging.example.com)",
+      "display_command": "ssh myapp-s",
+      "ssh_host": "myapp-s",
+      "driver": "shell"
+    },
+    "myapp-staging-console": {
+      "description": "MyApp staging Rails console",
+      "display_command": "ssh myapp-s\ncd myapp\nbin/rails console",
+      "ssh_host": "myapp-s",
+      "startup": ["cd myapp", "bin/rails console"],
+      "driver": "rails_irb"
+    },
+    "myapp-production-shell": {
+      "description": "MyApp production shell (myapp.example.com)",
+      "display_command": "ssh myapp",
+      "ssh_host": "myapp",
+      "driver": "shell"
+    },
+    "myapp-production-console": {
+      "description": "MyApp production Rails console",
+      "display_command": "ssh myapp\ncd myapp\nbin/rails console",
+      "ssh_host": "myapp",
+      "startup": ["cd myapp", "bin/rails console"],
+      "driver": "rails_irb"
+    },
+    "myapi-staging-shell": {
+      "description": "MyAPI staging shell (ECS Fargate task, via the app's own bin/shell)",
+      "transport": "script",
+      "script": "~/src/myapi/bin/shell",
+      "args": ["staging"],
+      "display_command": "~/src/myapi/bin/shell staging",
+      "driver": "shell"
+    },
+    "myapi-staging-console": {
+      "description": "MyAPI staging Rails console (ECS Fargate task, via the app's own bin/shell)",
+      "transport": "script",
+      "script": "~/src/myapi/bin/shell",
+      "args": ["staging"],
+      "display_command": "~/src/myapi/bin/shell staging\nbin/rails console",
+      "startup": ["bin/rails console"],
+      "driver": "rails_irb"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "airlock",
+  "description": "Human-gated remote terminal bridge (MCP server). Experimental: an approval gate, not a security boundary.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "shiki": "^3.0.0"
+  }
+}
