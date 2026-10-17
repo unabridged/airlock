@@ -63,9 +63,10 @@ func decide(_ decision: String, message: String? = nil) -> Never {
 }
 
 // The page metrics {didFinish} reads out of the rendered approval page: the
-// body height sizes the panel, the note-slot rect positions the native note
-// field over the page's slot, and the header height bounds the window's
-// drag strip.
+// body width and height size the panel (the page lays itself out at the
+// width that shows every column of the command), the note-slot rect
+// positions the native note field over the page's slot, and the header
+// height bounds the window's drag strip.
 struct PageMetrics: Decodable {
   struct Slot: Decodable {
     let x: Double
@@ -74,6 +75,7 @@ struct PageMetrics: Decodable {
     let height: Double
   }
 
+  let width: Double
   let height: Double
   let headerHeight: Double
   let slot: Slot
@@ -129,6 +131,7 @@ final class ApprovalPanelController: NSObject, NSWindowDelegate, WKNavigationDel
     // Missing #note-slot makes the script throw, which lands in the fallback.
     let measurementScript = """
       JSON.stringify({
+        width: document.body.getBoundingClientRect().width,
         height: document.body.getBoundingClientRect().height,
         headerHeight: document.querySelector(".head").getBoundingClientRect().height,
         slot: (({x, y, width, height}) => ({x, y, width, height}))(
@@ -266,11 +269,17 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
 
   let controller = ApprovalPanelController()
 
-  let panelWidth: CGFloat = 680
+  let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+  // The panel opens at the width the rendered page reports (the gutter plus
+  // the command's full 80 columns), never narrower than the pre-measurement
+  // width and never wider than the screen minus its margins.
+  let minimumPanelWidth: CGFloat = 680
+  let maximumPanelWidth = max(minimumPanelWidth, visibleFrame.width - 48)
+  var panelWidth = minimumPanelWidth
   // The panel opens at the height its content actually needs — measured from
   // the rendered page — capped at maxPanelHeight (longer commands scroll
   // inside the page's <pre> while the page's footer stays pinned).
-  let maxPanelHeight: CGFloat = 440
+  let maxPanelHeight: CGFloat = min(720, (0.7 * visibleFrame.height).rounded(.down))
   let minPanelHeight: CGFloat = 140
   // Clear margin reserved around the glass for the design's drop shadow
   // (0 10px 30px at 17% black): wide enough for the offset plus the blur.
@@ -423,17 +432,20 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
     panelRevealed = true
     var glassHeight = maxPanelHeight
     if let pageMetrics {
+      panelWidth = max(minimumPanelWidth, min(CGFloat(pageMetrics.width).rounded(.up), maximumPanelWidth))
       glassHeight = min(maxPanelHeight, max(minPanelHeight, CGFloat(pageMetrics.height).rounded(.up)))
       panel.setContentSize(NSSize(width: panelWidth + shadowMargin * 2, height: glassHeight + shadowMargin * 2))
       glassHostView.frame = NSRect(x: shadowMargin, y: shadowMargin, width: panelWidth, height: glassHeight)
       containerView.layer?.shadowPath = CGPath(
         roundedRect: glassHostView.frame, cornerWidth: 14, cornerHeight: 14, transform: nil)
       let headerHeight = CGFloat(pageMetrics.headerHeight)
-      // Frame against the content view's current height, not {glassHeight}:
-      // NSGlassEffectView resizes its content view lazily, so it may still be
-      // {maxPanelHeight} tall here, and the top-pinned strip follows it down.
+      // Frame against the content view's current size, not {panelWidth} and
+      // {glassHeight}: NSGlassEffectView resizes its content view lazily, so
+      // it may still be the pre-measurement size here, and the strip's
+      // autoresizing mask carries it to the final width and the final top.
       dragStripView.frame = NSRect(
-        x: 0, y: contentView.bounds.height - headerHeight, width: panelWidth, height: headerHeight)
+        x: 0, y: contentView.bounds.height - headerHeight, width: contentView.bounds.width,
+        height: headerHeight)
       // The page and the glass share an origin and a scale, differing only
       // in the Y axis: web rects grow downward from the top-left, AppKit
       // frames upward from the bottom-left — hence the height flip. GLASS
@@ -447,13 +459,10 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
     }
     // The 24pt screen-corner margins apply to the visible GLASS edges; the
     // clear shadow margin around it must not push the panel further in.
-    if let screen = NSScreen.main {
-      let visible = screen.visibleFrame
-      panel.setFrameOrigin(NSPoint(
-        x: visible.maxX - 24 - panelWidth - shadowMargin,
-        y: visible.maxY - 24 - glassHeight - shadowMargin
-      ))
-    }
+    panel.setFrameOrigin(NSPoint(
+      x: visibleFrame.maxX - 24 - panelWidth - shadowMargin,
+      y: visibleFrame.maxY - 24 - glassHeight - shadowMargin
+    ))
     if approvalRequest.silent != true {
       NSSound(named: "Hero")?.play()
     }
