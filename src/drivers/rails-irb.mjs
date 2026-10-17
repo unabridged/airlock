@@ -13,7 +13,10 @@
 // reported ready.
 //
 // Verified stock shapes (IRB 1.18) the learned patterns must keep covering:
-//   top-level:     irb(main):001>            (counter increments every input)
+//   top-level:     irb(main):001>            (counter increments once per
+//                                             pasted line, so a bracketed
+//                                             paste advances it by its line
+//                                             count)
 //   continuation:  irb(main):002*            (and "/' string continuations)
 //   echo trap:     irb(main):004>   .sum     (echoed final line of a COMPLETE
 //                                             multiline expression also shows >)
@@ -78,6 +81,23 @@ export function buildIrbPromptPatterns(detectedPrompt) {
   };
 }
 
+// The lines a paste hands IRB: {pasteCommand} strips trailing newlines, so
+// they count for nothing.
+export function pastedLineCount(command) {
+  return command.replace(/\n+$/, "").split("\n").length;
+}
+
+// Whether a ready prompt's counter proves the whole paste was consumed. IRB
+// increments the counter once per pasted line, and a blank row inside a
+// bracketed paste renders as a ready-shaped prompt on the way, so "the
+// counter changed" can hold mid-paste over SSH; only a counter that has
+// advanced by the paste's full line count proves the input is complete.
+// Without a counter (a custom prompt) the history boundary is the only proof.
+export function pasteConsumed({ counter, preCommandCounter, lineCount }) {
+  if (preCommandCounter === null) return true;
+  return counter !== null && counter >= preCommandCounter + lineCount;
+}
+
 export function createRailsIrbDriver({ startupCommands = [] } = {}) {
   let promptLine = null;
   let promptPatterns = null;
@@ -114,17 +134,18 @@ export function createRailsIrbDriver({ startupCommands = [] } = {}) {
     // Two independent proofs that a matched ready prompt is the NEXT one and
     // not the still-rendered pre-command prompt (which persists for one SSH
     // round-trip after paste+Enter): the rendered history must have grown
-    // past the boundary, and the prompt counter must have moved (when the
-    // prompt has one — IRB increments it on every input).
+    // past the boundary, and the prompt counter must have advanced by the
+    // whole paste (when the prompt has one; see {pasteConsumed}).
     const preCommandSnapshot = await paneSnapshot(tmux);
     const preCommandCounter = promptCounter(preCommandSnapshot.lastLine);
+    const lineCount = pastedLineCount(command);
     const boundaryLineCount = await markOutputBoundary(tmux);
     await pasteCommand(tmux, command);
     await waitForReadyPrompt({
       tmux,
       isReady: (snapshot) =>
         isReady(snapshot) &&
-        (preCommandCounter === null || promptCounter(snapshot.lastLine) !== preCommandCounter),
+        pasteConsumed({ counter: promptCounter(snapshot.lastLine), preCommandCounter, lineCount }),
       timeoutMs: timeouts.commandMs,
       describeWaitingState,
       boundaryLineCount,
