@@ -6,6 +6,8 @@
 // call); if it cannot load, the page falls back to escaped plain text — an
 // approval panel must always render.
 
+import { COMMAND_COLUMNS } from "./command-contract.mjs";
+
 const THEME = "houston";
 const LANGUAGE = "ruby";
 
@@ -90,7 +92,7 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
   const rows = lines
     .map(
       (lineHtml, index) =>
-        `<div class="ln"><span class="n" data-n="${index + 1}"></span><span class="c">${lineHtml || "&nbsp;"}</span></div>`,
+        `<div class="ln"><span class="n" data-n="${index + 1}"></span><span class="c">${lineHtml}</span></div>`,
     )
     .join(""); // the rows sit inside a <pre>: a literal newline here would double-space
 
@@ -108,8 +110,13 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
                   ratio when editor.lineHeight is unset) — keep them in sync. */
                font: 400 19px/1.5 Menlo, monospace; }
   /* Column layout capped at the viewport so a long command scrolls inside
-     the <pre> while the footer stays pinned to the panel bottom. */
-  body { display: flex; flex-direction: column; max-height: 100vh; }
+     the <pre> while the footer stays pinned to the panel bottom. The width
+     is the gutter plus the contract's ${COMMAND_COLUMNS} columns plus room
+     for the scrollbar and the right margin: the helper reads the body width
+     out of the rendered page and sizes the panel to it, so every approved
+     column is on screen without a fade or a clip. */
+  body { display: flex; flex-direction: column; max-height: 100vh;
+         width: calc(2.5em + ${COMMAND_COLUMNS}ch + 66px); }
   .head, .foot { flex: none; }
   /* The header doubles as the window's drag strip — unselectable, so WebKit
      passes its mouse-downs through to AppKit instead of starting a text
@@ -126,12 +133,9 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
   .badge.prod { background: #5d3a42; color: #ff96a0; }
   .badge.staging { background: #5b5138; color: #ffd57a; }
   .title { color: #d6d9e9; font-size: 18px; font-weight: 510; }
-  /* Overflowing code fades out at the right edge instead of hard-clipping;
-     the mask is a fixed window over the scroll box, so the fade holds its
-     place while the command scrolls beneath it. */
-  pre { margin: 0; padding: 0 0 5px; overflow: auto; flex: 1 1 auto; min-height: 0;
-        -webkit-mask-image: linear-gradient(90deg, #000 618px, transparent 670px);
-        mask-image: linear-gradient(90deg, #000 618px, transparent 670px); }
+  /* The code block is a positioning context for the more-lines badge. */
+  .code { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
+  pre { margin: 0; padding: 0 0 5px; overflow: auto; flex: 1 1 auto; min-height: 0; }
   .ln { display: flex; }
   /* Line numbers render as pseudo-content from data-n: generated content is
      not part of the document, so a selection sweeping the command can never
@@ -139,7 +143,19 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
   .ln .n { flex: none; width: 1.75em; text-align: right; padding-right: 0.75em;
            color: #545864; -webkit-user-select: none; user-select: none; }
   .ln .n::before { content: attr(data-n); }
-  .ln .c { white-space: pre; padding-right: 14px; }
+  /* The contract keeps every line within the body's columns; wrapping is
+     the fallback for the one text the contract does not bound (a target's
+     display_command), so no byte is ever clipped. */
+  .ln .c { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
+           padding-right: 14px; }
+  /* A persistent count of the rows still below the fold, so a reviewer never
+     approves a command whose tail they have not scrolled to. */
+  #more-lines { position: absolute; right: 18px; bottom: 10px;
+                padding: 4px 12px; border-radius: 999px;
+                background: rgba(84, 185, 255, 0.18); color: #54b9ff;
+                font: 600 13px/1.5 -apple-system, system-ui, sans-serif;
+                pointer-events: none; -webkit-user-select: none; user-select: none; }
+  #more-lines[hidden] { display: none; }
   .foot { display: flex; align-items: center; gap: 12px; padding: 18px;
           font-family: -apple-system, system-ui, sans-serif;
           -webkit-user-select: none; }
@@ -201,7 +217,7 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
     <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
     <span class="title">${escapeHtml(headerText)}</span>
   </div>
-  <pre>${rows}</pre>
+  <div class="code"><pre>${rows}</pre><span id="more-lines" hidden></span></div>
   <div class="foot">
     <div id="note-slot"></div>
     <button class="deny">Deny <span class="countdown" id="countdown">${Number(timeoutSeconds)}</span></button>
@@ -226,6 +242,20 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
       // The 👀 half of the split Approve: the helper opens the terminal on
       // the session, then records the decision as an approval.
       document.querySelector(".eyes").addEventListener("click", () => decide("watch"));
+      // Rows below the fold, from the scroll box's own geometry; the badge
+      // follows the scroll position and goes away at the end.
+      const codeBlock = document.querySelector("pre");
+      const moreLines = document.getElementById("more-lines");
+      const rowHeight = parseFloat(getComputedStyle(codeBlock).lineHeight);
+      const updateMoreLines = () => {
+        const hiddenHeight = codeBlock.scrollHeight - codeBlock.clientHeight - codeBlock.scrollTop;
+        const hiddenRows = Math.round(hiddenHeight / rowHeight);
+        moreLines.hidden = hiddenRows <= 0;
+        moreLines.textContent = hiddenRows + " more line" + (hiddenRows === 1 ? "" : "s") + " below";
+      };
+      codeBlock.addEventListener("scroll", updateMoreLines);
+      window.addEventListener("resize", updateMoreLines);
+      updateMoreLines();
     })();
   </script>
 </body></html>`;

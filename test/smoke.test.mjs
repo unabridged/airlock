@@ -13,8 +13,8 @@ import { fileURLToPath } from "node:url";
 
 import { requestApproval } from "../src/approval.mjs";
 import { currentClaudeSessionTitle } from "../src/claude-session.mjs";
-import { highlightRuby, escapeHtml } from "../src/colorize.mjs";
-import { CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
+import { buildApprovalHtml, highlightRuby, escapeHtml } from "../src/colorize.mjs";
+import { COMMAND_COLUMNS, CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { capOutput } from "../src/output-stream.mjs";
 import { explicitHostAliases } from "../src/ssh-config.mjs";
@@ -384,6 +384,45 @@ describe("highlightRuby", () => {
 
   it("escapes all reserved characters", () => {
     assert.equal(escapeHtml(`<a href="x">&`), "&lt;a href=&quot;x&quot;&gt;&amp;");
+  });
+});
+
+describe("buildApprovalHtml", () => {
+  // The text a reviewer reads: each row's code cell with the highlighting
+  // tags stripped and the HTML escapes undone.
+  function renderedCommandText(html) {
+    return [...html.matchAll(/<span class="c">([\s\S]*?)<\/span><\/div>/g)]
+      .map(([, cellHtml]) =>
+        cellHtml
+          .replace(/<[^>]+>/g, "")
+          .replaceAll("&lt;", "<")
+          .replaceAll("&gt;", ">")
+          .replaceAll("&quot;", '"')
+          .replaceAll("&amp;", "&"),
+      )
+      .join("\n");
+  }
+
+  const command = [
+    "report = <<~TEXT",
+    '  a < b && c > "d" & e',
+    "",
+    "  emoji 👀  two  spaces, \\ and 'quotes'",
+    "TEXT",
+    'puts "report: #{report}"',
+  ].join("\n");
+
+  it("shows every byte of the command, blank lines included", async () => {
+    const html = await buildApprovalHtml({ command, badge: "test-shell", headerText: "Send?", timeoutSeconds: 30 });
+    assert.equal(renderedCommandText(html), command);
+  });
+
+  it(`lays the page out at ${COMMAND_COLUMNS} columns with wrapping instead of a fade`, async () => {
+    const html = await buildApprovalHtml({ command, badge: "test-shell", headerText: "Send?", timeoutSeconds: 30 });
+    assert.doesNotMatch(html, /mask-image/);
+    assert.match(html, new RegExp(`width: calc\\(2\\.5em \\+ ${COMMAND_COLUMNS}ch \\+ 66px\\)`));
+    assert.match(html, /\.ln \.c \{ white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;/);
+    assert.match(html, /<span id="more-lines" hidden><\/span>/);
   });
 });
 
