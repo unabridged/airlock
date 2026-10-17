@@ -7,11 +7,11 @@ An approved, persistent remote terminal bridge for Claude Code on macOS.
 > does not stop a model that can reach the hosts another way (a local `ssh`, a
 > `net-ssh` one-liner, the `tmux` CLI, the SSH agent socket), and it is only as
 > strong as the sandbox and permission rules around it. Its own security review
-> found gaps that are not yet fixed, including ways the approved text can be
-> made to differ from what the remote shell receives. Read
-> [SECURITY.md](SECURITY.md) before pointing it at anything you care about, and
-> treat it as an approval UX with an audit trail, not as what keeps an agent off
-> production.
+> found gaps that are not yet fixed, including ways remote output can fake a
+> command's completion and SSH configuration that runs more than the overlay
+> shows. Read [SECURITY.md](SECURITY.md) before pointing it at anything you
+> care about, and treat it as an approval UX with an audit trail, not as what
+> keeps an agent off production.
 
 ![The approval overlay for a production Rails console command](docs/approval-overlay.png)
 
@@ -37,6 +37,41 @@ Agent sees five tools:
 
 Deny can carry a feedback note, which rides back to the agent so it can adjust 
 and resend.
+
+**Style contract:** `send_terminal` checks every command against a style
+contract before the overlay pops, so the human only reviews text they can read
+at a glance. The overlay shows every approved byte at 80 columns without a
+fade. The bridge enforces these rules, and the tool description teaches them to
+the agent:
+
+- At most 80 columns per line, and at most 60 lines and 32 KiB per send.
+- One statement per line. Shell control flow such as `for f in *.log; do wc -l
+  $f; done` is the one allowed use of `;`.
+- No comment lines.
+- Full-word variable names, such as `order` rather than `o` or `tmp`.
+- Spaces around `=` and after every comma.
+- Exactly one blank line between sections, and a multi-section command prints
+  labeled values such as `puts "count: #{count}"`.
+- Arrays fill-wrapped, never one element per line.
+- No trailing spaces.
+- No tabs, control characters, zero-width or bidirectional characters, or
+  non-ASCII spaces.
+
+The bridge never reformats a command. Its only change is dropping one trailing
+newline. A rejected command never reaches the human, and the rejection lists
+every problem so the agent fixes them in one resend:
+
+```text
+send_terminal rejected before approval: the command breaks the style contract (2 problems). The human has NOT seen it.
+  - line 1, col 1: [name] variable `u` — use the full name of the object it holds (e.g. `order`, not `o`)
+      "u = User.find(1234); puts u.email"
+  - line 1, col 20: [statements] 2 statements joined by `;` — one statement per line
+      "u = User.find(1234); puts u.email"
+Fix every item and resend the whole command. If an item cannot be satisfied for this command, stop and relay this message to the human instead of retrying.
+```
+
+The character rule also runs over the configuration at load: `instructions`,
+each target's `display_command`, and its `startup` lines.
 
 Sessions are persistent and exclusive: one active session across all
 windows, and console state (variables, loaded records) survives between

@@ -2,9 +2,10 @@
 
 ## Status
 
-Experimental. The hardening review below (2026-08-24) found seven gaps, and
-none of them is remediated as of 2026-10-16. Until they are, Airlock is an
-approval gate with an audit trail, not a security boundary. Do not rely on it
+Experimental. The hardening review below (2026-08-24) found seven gaps. As of
+2026-10-16, finding 2 is remediated, finding 6 is remediated for command size,
+and the other five are open. Until they are closed, Airlock is an approval gate
+with an audit trail, not a security boundary. Do not rely on it
 as the only thing standing between an agent and a production host.
 
 ## Threat model
@@ -24,8 +25,9 @@ the following assumptions holds. Each one that fails makes the gate decorative.
    the agent's sandbox. Today they are, whenever the agent works in this
    checkout (finding 1).
 3. **The approval text is what gets sent.** A human reading the overlay sees
-   exactly the bytes the bridge will paste. Control, ANSI, and bidirectional
-   characters can currently make the display differ from the bytes (finding 2).
+   exactly the bytes the bridge will paste. The bridge rejects control, ANSI,
+   bidirectional, and zero-width characters before the overlay pops, so they
+   cannot make the display differ from the bytes (finding 2, remediated).
 4. **Remote programs are not actively hostile to the bridge.** Remote output is
    treated as untrusted data, but completion is detected from the rendered
    prompt, and a cooperating foreground process can forge it and receive the
@@ -42,7 +44,7 @@ host's own security; and denial of service beyond the bounds in finding 6.
 ## Hardening review
 
 Date: 2026-08-24  
-Status: Review complete; remediation not started  
+Status: Review complete; finding 2 remediated, finding 6 remediated for command size  
 Scope: Production bridge, native approval helper, terminal drivers, SSH configuration, and deployment assumptions
 
 ## Objective
@@ -56,11 +58,11 @@ The current implementation has strong foundations—argv-only process spawning, 
 | Priority | Finding | Primary locations |
 | --- | --- | --- |
 | P1 | The approval helper and server installation can be modified from a writable workspace | `src/approval.mjs:16-29`, `src/approval.mjs:85-92` |
-| P1 | Control and bidirectional characters can make the approval display differ from executed bytes | `src/server.mjs:258-280`, `src/colorize.mjs:74-98` |
+| P1 | Control and bidirectional characters can make the approval display differ from executed bytes (remediated) | `src/command-contract.mjs` |
 | P1 | Remote output can forge the recognized prompt and trigger false completion | `src/output-stream.mjs:55-87`, `src/drivers/shell.mjs:91-96`, `src/drivers/rails-irb.mjs:85-90` |
 | P2 | Startup readiness uses negative authentication filtering and can adopt the wrong input state | `src/drivers/shell.mjs:160-167`, `src/drivers/rails-irb.mjs:152-180` |
 | P2 | An allowed SSH alias can still execute undisclosed local actions or open forwarding paths | `src/session-manager.mjs:39-50`, `src/ssh-config.mjs:19-59` |
-| P2 | JSON-RPC input, command size, and the approval backlog are unbounded | `src/server.mjs:463-483`, `src/approval.mjs:40-63` |
+| P2 | JSON-RPC input and the approval backlog are unbounded (command size is bounded) | `src/server.mjs:463-483`, `src/approval.mjs:40-63` |
 | P1 operational | The required sandbox isolation self-check is specified but not implemented | `PLAN.md:697-716`, `PLAN.md:848-853` |
 
 ## Required security invariants
@@ -108,6 +110,31 @@ Protecting only `~/.local/state/airlock` is insufficient. The bridge source, lau
 - An Airlock development session cannot use the mutable checkout as its production MCP server.
 
 ## 2. Make approval text byte-faithful
+
+### Status
+
+Implemented by `src/command-contract.mjs`. `send_terminal` runs every command
+through the contract before the overlay pops, and the checked string is the one
+both the overlay and the driver receive. The contract rejects, naming the code
+point and its line and column:
+
+- malformed Unicode (unpaired surrogates);
+- every C0 and C1 control except LF, which covers ESC, CR, NUL, BS, DEL, and
+  TAB;
+- every formatting character: bidirectional embeddings, overrides, isolates,
+  and marks, zero-width characters, and the BOM;
+- separators that render like a space or a newline without being one: NBSP,
+  the other non-ASCII spaces, and U+2028/U+2029.
+
+The one canonicalization is dropping a single trailing LF, which both drivers
+strip anyway. Trailing spaces and leading, trailing, or doubled blank lines are
+rejected too, so the overlay never hides whitespace that affects execution. The
+overlay shows every approved byte at 80 columns without a fade. Lines wrap
+rather than clip, and a badge counts the rows still below the fold.
+
+The same character rule runs at config load over `instructions`,
+`display_command`, and every `startup` line. Target keys and the client
+identity shown in the overlay header are not yet checked.
 
 ### Risk
 
@@ -231,6 +258,13 @@ Do not use `ssh -G` as the sole validator for an untrusted configuration: config
 A script target runs a local executable named in the config, with fixed arguments, instead of `ssh`. The validator pins the path (absolute after tilde expansion, a regular executable file) and the arguments (single whitespace-free tokens), so the overlay line is the exact argv — but what that executable does is not represented by the line. In the intended use it is a project's connection helper wrapping `aws ecs execute-command`, which reads `~/.aws` for the profile (`credential_process`, SSO, and role chaining are side effects), finds `session-manager-plugin` on the bridge's PATH, and chooses the task at open time. The script's contents are trusted code, exactly like the SSH configuration: audited, and denied to the agent's local Bash/Edit — together with `~/.aws`, and with the script's own name as a Bash command.
 
 ## 6. Bound input and approval concurrency
+
+### Status
+
+Command size is bounded. The contract in `src/command-contract.mjs` rejects a
+command over 32 KiB or 60 lines before colorization or the approval helper
+runs. JSON-RPC request bytes, helper stdout, and pending approvals remain
+unbounded.
 
 ### Risk
 
