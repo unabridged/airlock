@@ -570,8 +570,9 @@ For after `bin/rails console`. Recognize the IRB top-level prompt; never treat a
 continuation prompt as completion.
 
 **[AMENDED] Verified prompt shapes (IRB 1.18, this machine):**
-- Top-level: `irb(main):001> ` — zero-padded 3-digit counter, increments every
-  input (including errors).
+- Top-level: `irb(main):001> ` — zero-padded 3-digit counter, increments once
+  per pasted line (including errors), so a bracketed multi-line paste advances
+  it by its line count.
 - Continuation: `irb(main):002*` — asterisk instead of `>`.
 - Trap: the echoed final line of a *complete* multiline expression also shows `>`
   with trailing text (`irb(main):004>   .sum`). So the matcher must match an
@@ -968,7 +969,8 @@ drivers learn the prompt from the live pane during startup**:
   an `isSettledLine` predicate — a loading console pauses quiet for seconds
   mid-banner, so plain quiescence is not enough), adopts that line, and
   derives anchored patterns with every digit run freed (stock counters
-  increment per input; counterless custom prompts fall back to the
+  increment per pasted line, so completion waits for the counter to advance
+  by the paste's line count; counterless custom prompts fall back to the
   history-boundary completion proof alone). The pager-disable round-trip
   doubles as adoption verification: its echoed `false` proves the adopted
   line really talks to IRB, else startup fails with a typed error.
