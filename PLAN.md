@@ -811,7 +811,7 @@ After the bridge works, add a small Claude Code skill:
 - Use `send_terminal` for every remote command; preserve natural multiline
   formatting; send the smallest coherent command per step.
 - Do not convert readable Ruby into shell-escaped one-liners.
-- Do not add explanatory comments inside the command just for the approval dialog.
+- Do not add comment lines inside the command: the bridge rejects comment lines.
 - The MCP call waits for completion — never add `sleep`.
 - The MCP result contains the output — consume it directly; only use the
   terminal-reading capability for history/context not already returned.

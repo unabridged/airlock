@@ -7,6 +7,7 @@
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { characterViolations } from "./command-contract.mjs";
 import { expandTilde, explicitHostAliases } from "./ssh-config.mjs";
 
 export const CONFIG_PATH = join(homedir(), ".config", "airlock", "config.json");
@@ -88,6 +89,7 @@ export function loadConfig(configPath = CONFIG_PATH) {
   for (const [targetKey, target] of Object.entries(parsed.targets)) {
     targets[targetKey] = validateTarget(targetKey, target, problems);
   }
+  problems.push(...displayTextProblems(parsed.instructions, targets));
   if (problems.length > 0) {
     throw configError(configPath, problems);
   }
@@ -118,6 +120,29 @@ export function loadConfig(configPath = CONFIG_PATH) {
     targets,
     ...tuning,
   };
+}
+
+// Config text reaches the overlay (a target's display_command and startup
+// lines open a session) and the model (instructions), so it is held to the
+// contract's character rule: a control, formatting, or confusable-space
+// character anywhere is a startup error naming the field and the position.
+function displayTextProblems(instructions, targets) {
+  const texts = [["instructions", instructions]];
+  for (const [targetKey, target] of Object.entries(targets)) {
+    if (target === null || typeof target !== "object") continue;
+    texts.push([`targets.${targetKey}.display_command`, target.display_command]);
+    (Array.isArray(target.startup) ? target.startup : []).forEach((line, index) => {
+      texts.push([`targets.${targetKey}.startup[${index}]`, line]);
+    });
+  }
+  const problems = [];
+  for (const [field, text] of texts) {
+    if (typeof text !== "string") continue;
+    for (const { line, column, message } of characterViolations(text)) {
+      problems.push(`${field} line ${line}, col ${column}: ${message}`);
+    }
+  }
+  return problems;
 }
 
 // Returns the target normalized with its transport made explicit (and, for a
