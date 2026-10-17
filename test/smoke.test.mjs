@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { requestApproval } from "../src/approval.mjs";
 import { currentClaudeSessionTitle } from "../src/claude-session.mjs";
 import { highlightRuby, escapeHtml } from "../src/colorize.mjs";
+import { CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { capOutput } from "../src/output-stream.mjs";
 import { explicitHostAliases } from "../src/ssh-config.mjs";
@@ -455,6 +456,27 @@ describe("loadConfig", () => {
     });
     assert.throws(() => loadConfig(configPath), /not an explicit Host alias/);
   });
+
+  it("rejects control and formatting characters in text the overlay or the model reads", () => {
+    const configPath = writeBridgeConfig({
+      instructions: "Use\ttabs.",
+      targets: {
+        hidden: {
+          description: "Bidi override in a startup line",
+          display_command: "ssh testhost\ncd app\u202e\nbin/rails console",
+          ssh_host: "testhost",
+          startup: ["cd app\u202e", "bin/rails console"],
+          driver: "rails_irb",
+        },
+      },
+    });
+    assert.throws(() => loadConfig(configPath), (err) => {
+      assert.match(err.message, /- instructions line 1, col 4: TAB \(U\+0009\)/);
+      assert.match(err.message, /- targets\.hidden\.display_command line 2, col 7: RLO \(U\+202E\)/);
+      assert.match(err.message, /- targets\.hidden\.startup\[0\] line 1, col 7: RLO \(U\+202E\)/);
+      return true;
+    });
+  });
 });
 
 // ---- server end-to-end (stdio JSON-RPC, no tmux, no ssh) ------------------
@@ -524,6 +546,7 @@ describe("server.mjs over stdio", () => {
       // Standing guidance: relay open_terminal's attach block so the human
       // gets a one-click Run button to watch the session.
       assert.match(initialized.result.instructions, /attach block/);
+      assert.ok(initialized.result.instructions.includes(CONTRACT_SPEC_TEXT));
 
       const toolsListed = await call("tools/list", {});
       assert.deepEqual(
@@ -537,6 +560,10 @@ describe("server.mjs over stdio", () => {
       // Closing is a pure de-escalation and must advertise itself as ungated.
       const closeTool = toolsListed.result.tools.find((tool) => tool.name === "close_terminal");
       assert.match(closeTool.description, /No approval needed/);
+
+      // The model reads the contract where it writes the command.
+      const sendTool = toolsListed.result.tools.find((tool) => tool.name === "send_terminal");
+      assert.ok(sendTool.description.endsWith(CONTRACT_SPEC_TEXT));
 
       for (const prototypeKey of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
         const rejected = await call("tools/call", {
@@ -829,6 +856,56 @@ describe("server.mjs over stdio", () => {
       assert.ok(!existsSync(overlayMarker), "the approval overlay must not have popped");
     } finally {
       spawnSync(tmuxBinaryForTests(), ["-S", socketPath, "kill-server"]);
+      child.kill();
+    }
+  });
+
+  it("rejects a command that breaks the contract before the overlay pops", async () => {
+    const overlayLog = join(scratch, `e2e-contract-overlays-${Math.random().toString(36).slice(2)}`);
+    // A script target wrapping a local bash stands in for a remote shell.
+    const localShellPath = writeFakeHelper(
+      `local-shell-${Math.random().toString(36).slice(2)}`,
+      "exec /usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile",
+    );
+    const configPath = writeBridgeConfig({
+      targets: {
+        "local-shell": {
+          description: "Local bash standing in for a remote shell",
+          display_command: localShellPath,
+          transport: "script",
+          script: localShellPath,
+          driver: "shell",
+        },
+      },
+    });
+    const { child, call, stateDirectory } = startServer({
+      // Approves everything and logs one line per panel shown.
+      helperScript: `echo shown >> ${overlayLog}; cat > /dev/null; printf '{"decision":"approve"}'`,
+      env: { AIRLOCK_CONFIG: configPath },
+    });
+    const overlayCount = () => (existsSync(overlayLog) ? readFileSync(overlayLog, "utf8").split("\n").length - 1 : 0);
+    try {
+      await call("initialize", { protocolVersion: "2025-06-18" });
+      const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
+      assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+      assert.equal(overlayCount(), 1);
+
+      const wideCommand = `echo ${"a".repeat(115)}`;
+      assert.equal(wideCommand.length, 120);
+      const rejected = await call("tools/call", { name: "send_terminal", arguments: { command: wideCommand } });
+      assert.equal(rejected.result.isError, true);
+      assert.match(rejected.result.content[0].text, /^send_terminal rejected before approval/);
+      assert.match(rejected.result.content[0].text, /line 1, col 81: \[width\] 120 columns; the limit is 80/);
+      assert.equal(overlayCount(), 1, "the approval overlay must not have popped");
+
+      const sent = await call("tools/call", { name: "send_terminal", arguments: { command: "echo hello\n" } });
+      assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
+      assert.match(sent.result.content[0].text, /hello/);
+      assert.equal(overlayCount(), 2);
+
+      await call("tools/call", { name: "close_terminal", arguments: {} });
+    } finally {
+      spawnSync(tmuxBinaryForTests(), ["-S", join(stateDirectory, "tmux.sock"), "kill-server"]);
       child.kill();
     }
   });
