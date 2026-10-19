@@ -97,6 +97,10 @@ Requirements: macOS, `tmux`, Node, and the Xcode command-line tools (for
    npm install && mkdir -p bin && /usr/bin/swiftc -O -o bin/airlock-approve airlock-approve.swift
    ```
 
+   Nothing rebuilds the helper for you, so rerun the `swiftc` step whenever
+   `airlock-approve.swift` changes, a pull included. Until you do, the server
+   warns at startup and whenever `open_terminal` asks for approval.
+
 2. Create `~/.config/airlock/config.json` from
    [`config.example.json`](config.example.json). A target is reached either
    over SSH (`ssh_host` names an explicit `Host` alias from your
@@ -191,7 +195,7 @@ node --test "test/*.test.mjs"
 
 The suite includes live local tmux + IRB integration tests; no approval
 panels pop and no remote connections are made. Rebuild the helper (step 1
-above) after editing `airlock-approve.swift`.
+above) after editing or pulling changes to `airlock-approve.swift`.
 
 ## Layout
 

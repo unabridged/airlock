@@ -14,7 +14,7 @@
 // terminal-shaped goes through the session manager.
 
 import { createInterface } from "node:readline";
-import { approvalHelperStartupProblem, requestApproval } from "./approval.mjs";
+import { approvalHelperProblem, requestApproval } from "./approval.mjs";
 import { currentClaudeSessionTitle } from "./claude-session.mjs";
 import {
   checkCommandContract,
@@ -56,7 +56,7 @@ const sessionManager = new SessionManager({ config, stateDirectory });
 
 // A missing helper is a call-time non-approval by contract, but the
 // misconfiguration should be named at registration time, not mid-workflow.
-const helperProblem = approvalHelperStartupProblem();
+const helperProblem = approvalHelperProblem();
 if (helperProblem) log(`warning: ${helperProblem}`);
 
 // Fallback identity for the overlay header, learned from initialize
@@ -232,6 +232,14 @@ function approverNote(approval) {
   return approval.message ? `\n\nNote from the human approver: ${approval.message}` : "";
 }
 
+// The startup warning lands in a log nobody watches mid-session, so every
+// open that asks for approval repeats it in the result, where the model sees
+// it and can relay it.
+function helperProblemNote() {
+  const problem = approvalHelperProblem();
+  return problem ? `\n\nSetup warning: ${problem}` : "";
+}
+
 // ---- tool handlers --------------------------------------------------------
 
 async function handleOpenTerminal(id, args) {
@@ -261,11 +269,11 @@ async function handleOpenTerminal(id, args) {
       actionDescription: `Open ${openHandle.targetKey}?`,
     });
     if (!approval.approved) {
-      textResult(id, notApprovedText(approval));
+      textResult(id, notApprovedText(approval) + helperProblemNote());
       return;
     }
     const report = await sessionManager.commitOpen(openHandle);
-    textResult(id, report + approverNote(approval));
+    textResult(id, report + approverNote(approval) + helperProblemNote());
   } finally {
     // A no-op once commitOpen owns the handle; releases the lock on deny,
     // timeout, or an overlay failure so a not-approved open never wedges the

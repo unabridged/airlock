@@ -5,13 +5,22 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { requestApproval } from "../src/approval.mjs";
+import { approvalHelperProblem, requestApproval } from "../src/approval.mjs";
 import { currentClaudeSessionTitle } from "../src/claude-session.mjs";
 import { buildApprovalHtml, highlightRuby, escapeHtml } from "../src/colorize.mjs";
 import { COMMAND_COLUMNS, CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
@@ -233,6 +242,41 @@ describe("requestApproval", () => {
     assert.match(events[0], /^start /);
     assert.match(events[1], /^end /);
     assert.equal(events[0].slice(6), events[1].slice(4)); // same pid: first finished before second started
+  });
+});
+
+// ---- approval helper setup -------------------------------------------------
+
+describe("approvalHelperProblem", () => {
+  const sourcePath = join(scratch, "helper-source.swift");
+  writeFileSync(sourcePath, "// helper source\n");
+
+  it("names a missing helper with the build command", () => {
+    const problem = approvalHelperProblem({ helperPath: join(scratch, "no-helper-here"), sourcePath });
+    assert.match(problem, /missing or not executable at .*no-helper-here/);
+    assert.match(problem, /swiftc -O -o bin\/airlock-approve airlock-approve\.swift/);
+  });
+
+  it("names a helper built before its source last changed", () => {
+    const helperPath = writeFakeHelper("stale-helper", "exit 0");
+    utimesSync(helperPath, 0, 0);
+    const problem = approvalHelperProblem({ helperPath, sourcePath });
+    assert.match(problem, /stale-helper is older than .*helper-source\.swift/);
+    assert.match(problem, /Rebuild it with: swiftc -O -o bin\/airlock-approve airlock-approve\.swift/);
+  });
+
+  it("passes a helper built after its source last changed", () => {
+    const helperPath = writeFakeHelper("fresh-helper", "exit 0");
+    const olderSourcePath = join(scratch, "older-helper-source.swift");
+    writeFileSync(olderSourcePath, "// helper source\n");
+    utimesSync(olderSourcePath, 0, 0);
+    assert.equal(approvalHelperProblem({ helperPath, sourcePath: olderSourcePath }), null);
+  });
+
+  it("passes a helper whose source is not around to compare against", () => {
+    const helperPath = writeFakeHelper("sourceless-helper", "exit 0");
+    utimesSync(helperPath, 0, 0);
+    assert.equal(approvalHelperProblem({ helperPath, sourcePath: join(scratch, "no-source-here") }), null);
   });
 });
 
@@ -748,6 +792,67 @@ describe("server.mjs over stdio", () => {
       assert.match(denied.result.content[0].text, /Not approved \(deny\)/);
       assert.match(denied.result.content[0].text, /use a count first, then resend/);
     } finally {
+      child.kill();
+    }
+  });
+
+  it("warns about a stale approval helper when the open is denied", async () => {
+    const staleHelper = writeFakeHelper("e2e-stale-helper", `cat > /dev/null; printf '{"decision":"deny"}'`);
+    utimesSync(staleHelper, 0, 0);
+    const stale = startServer({ helperScript: "", env: { AIRLOCK_APPROVE_HELPER: staleHelper } });
+    const fresh = startServer({ helperScript: `cat > /dev/null; printf '{"decision":"deny"}'` });
+    try {
+      const openArguments = { name: "open_terminal", arguments: { target: "test-shell" } };
+      await stale.call("initialize", { protocolVersion: "2025-06-18" });
+      const staleResult = await stale.call("tools/call", openArguments);
+      assert.match(staleResult.result.content[0].text, /Not approved \(deny\)/);
+      assert.match(staleResult.result.content[0].text, /\n\nSetup warning: approval helper at .*e2e-stale-helper is older than/);
+      await fresh.call("initialize", { protocolVersion: "2025-06-18" });
+      const freshResult = await fresh.call("tools/call", openArguments);
+      assert.doesNotMatch(freshResult.result.content[0].text, /Setup warning/);
+    } finally {
+      stale.child.kill();
+      fresh.child.kill();
+    }
+  });
+
+  it("warns about a stale approval helper when the open is approved", async () => {
+    // A script target wrapping a local bash stands in for a remote shell.
+    const localShellPath = writeFakeHelper(
+      `local-shell-${Math.random().toString(36).slice(2)}`,
+      "exec /usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile",
+    );
+    const configPath = writeBridgeConfig({
+      targets: {
+        "local-shell": {
+          description: "Local bash standing in for a remote shell",
+          display_command: localShellPath,
+          transport: "script",
+          script: localShellPath,
+          driver: "shell",
+        },
+      },
+    });
+    const staleHelper = writeFakeHelper(
+      "e2e-stale-approving-helper",
+      `cat > /dev/null; printf '{"decision":"approve"}'`,
+    );
+    utimesSync(staleHelper, 0, 0);
+    const { child, call, stateDirectory } = startServer({
+      helperScript: "",
+      env: { AIRLOCK_CONFIG: configPath, AIRLOCK_APPROVE_HELPER: staleHelper },
+    });
+    try {
+      await call("initialize", { protocolVersion: "2025-06-18" });
+      const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
+      assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+      assert.match(
+        opened.result.content[0].text,
+        /\n\nSetup warning: approval helper at .*e2e-stale-approving-helper is older than/,
+      );
+      await call("tools/call", { name: "close_terminal", arguments: {} });
+    } finally {
+      spawnSync(tmuxBinaryForTests(), ["-S", join(stateDirectory, "tmux.sock"), "kill-server"]);
       child.kill();
     }
   });
