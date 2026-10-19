@@ -64,9 +64,9 @@ func decide(_ decision: String, message: String? = nil) -> Never {
 
 // The page metrics {didFinish} reads out of the rendered approval page: the
 // body width and height size the panel (the page lays itself out at the
-// width that shows every column of the command), the note-slot rect
-// positions the native note field over the page's slot, and the header
-// height bounds the window's drag strip.
+// width that shows every column of the command, capped at the panel it
+// loads in), the note-slot rect positions the native note field over the
+// page's slot, and the header height bounds the window's drag strip.
 struct PageMetrics: Decodable {
   struct Slot: Decodable {
     let x: Double
@@ -270,12 +270,14 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   let controller = ApprovalPanelController()
 
   let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-  // The panel opens at the width the rendered page reports (the gutter plus
-  // the command's full 80 columns), never narrower than the pre-measurement
-  // width and never wider than the screen minus its margins.
+  // The page loads in a panel as wide as the screen allows (minus its
+  // margins), then {revealPanel} shrinks the panel to the width the page
+  // reports: the gutter plus the command's full 80 columns, never narrower
+  // than minimumPanelWidth. Loading wide matters because the page caps its
+  // own width at the viewport, so a narrower panel would read back as its
+  // own width, and the height of lines wrapped to fit it.
   let minimumPanelWidth: CGFloat = 680
   let maximumPanelWidth = max(minimumPanelWidth, visibleFrame.width - 48)
-  var panelWidth = minimumPanelWidth
   // The panel opens at the height its content actually needs — measured from
   // the rendered page — capped at maxPanelHeight (longer commands scroll
   // inside the page's <pre> while the page's footer stays pinned).
@@ -287,7 +289,7 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
 
   let panel = ApprovalPanel(
     contentRect: NSRect(
-      x: 0, y: 0, width: panelWidth + shadowMargin * 2, height: maxPanelHeight + shadowMargin * 2),
+      x: 0, y: 0, width: maximumPanelWidth + shadowMargin * 2, height: maxPanelHeight + shadowMargin * 2),
     styleMask: [.borderless, .nonactivatingPanel],
     backing: .buffered,
     defer: false
@@ -323,7 +325,7 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   // The controls live in a plain view hosted on liquid glass (below). The
   // view itself carries only a 40% wash of the sampled #353845 slate over
   // the glass, rounded to the panel radius so the corners stay glass-clean.
-  let contentView = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: maxPanelHeight))
+  let contentView = NSView(frame: NSRect(x: 0, y: 0, width: maximumPanelWidth, height: maxPanelHeight))
   contentView.autoresizingMask = [.width, .height]
   contentView.wantsLayer = true
   contentView.layer?.backgroundColor = NSColor(srgbRed: 0x35 / 255.0, green: 0x38 / 255.0, blue: 0x45 / 255.0, alpha: 0.4).cgColor
@@ -337,7 +339,7 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   webViewConfiguration.userContentController.add(controller, name: "decision")
 
   let webView = FirstMouseWebView(
-    frame: NSRect(x: 0, y: 0, width: panelWidth, height: maxPanelHeight),
+    frame: NSRect(x: 0, y: 0, width: maximumPanelWidth, height: maxPanelHeight),
     configuration: webViewConfiguration
   )
   webView.autoresizingMask = [.width, .height]
@@ -351,17 +353,18 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
 
   // Above the web view, so header mouse-downs drag the window instead of
   // reaching the page — the header renders nothing interactive, so nothing
-  // is lost. The height is the pre-measurement fallback; {revealPanel}
+  // is lost. The height is the pre-measurement fallback; {alignControls}
   // matches it to the header the page reports.
-  let dragStripView = DragStripView(frame: NSRect(x: 0, y: maxPanelHeight - 60, width: panelWidth, height: 60))
+  let dragStripView = DragStripView(frame: NSRect(x: 0, y: maxPanelHeight - 60, width: maximumPanelWidth, height: 60))
   dragStripView.autoresizingMask = [.width, .minYMargin]
   contentView.addSubview(dragStripView)
 
   // Chromeless: the page's #note-slot paints the bezel, this field brings
   // the native text editing (dictation, paste) that WKWebView inputs cannot
-  // offer in a non-activating panel. The frame is the pre-measurement
-  // fallback; {revealPanel} aligns it to the slot the page reports.
-  let messageField = NSTextField(frame: NSRect(x: 18, y: 18, width: panelWidth - 260, height: 43))
+  // offer in a non-activating panel. It stays hidden until {alignControls}
+  // frames it over the slot the page reports: at a guessed frame it could
+  // cover the page's buttons.
+  let messageField = NSTextField(frame: .zero)
   // Replacing the cell resets the field's editability — restore it
   // explicitly after the swap.
   messageField.cell = VerticallyCenteredTextFieldCell(textCell: "")
@@ -377,6 +380,7 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   messageField.usesSingleLineMode = true
   messageField.placeholderString = "Message"
   messageField.font = NSFont.systemFont(ofSize: 17)
+  messageField.isHidden = true
   contentView.addSubview(messageField)
   controller.messageField = messageField
   controller.watchCommandPath = approvalRequest.watchCommandPath
@@ -389,12 +393,12 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   // to the HUD blur material.
   let glassHostView: NSView
   if #available(macOS 26.0, *) {
-    let glassView = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: maxPanelHeight))
+    let glassView = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: maximumPanelWidth, height: maxPanelHeight))
     glassView.cornerRadius = 14
     glassView.contentView = contentView
     glassHostView = glassView
   } else {
-    let effectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: maxPanelHeight))
+    let effectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: maximumPanelWidth, height: maxPanelHeight))
     effectView.material = .hudWindow
     effectView.state = .active
     effectView.wantsLayer = true
@@ -408,55 +412,63 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
   // shadowOffset is negative because AppKit's Y axis points up, and the
   // radius is the Gaussian sigma (about half of CSS's 30px blur length).
   let containerView = NSView(
-    frame: NSRect(x: 0, y: 0, width: panelWidth + shadowMargin * 2, height: maxPanelHeight + shadowMargin * 2))
+    frame: NSRect(x: 0, y: 0, width: maximumPanelWidth + shadowMargin * 2, height: maxPanelHeight + shadowMargin * 2))
   containerView.wantsLayer = true
   containerView.layer?.shadowColor = NSColor.black.cgColor
   containerView.layer?.shadowOpacity = 0.17
   containerView.layer?.shadowRadius = 15
   containerView.layer?.shadowOffset = CGSize(width: 0, height: -10)
-  glassHostView.frame = NSRect(x: shadowMargin, y: shadowMargin, width: panelWidth, height: maxPanelHeight)
+  glassHostView.frame = NSRect(x: shadowMargin, y: shadowMargin, width: maximumPanelWidth, height: maxPanelHeight)
   containerView.layer?.shadowPath = CGPath(
     roundedRect: glassHostView.frame, cornerWidth: 14, cornerHeight: 14, transform: nil)
   containerView.addSubview(glassHostView)
   panel.contentView = containerView
   panel.appearance = NSAppearance(named: .darkAqua)
 
-  // The panel stays offscreen until the page reports its rendered height, so
-  // it opens exactly content-sized instead of flashing full-height and
+  // Aligns the drag strip to the header and the note field to the slot the
+  // page reports, at whatever size the panel opened, so a page measured
+  // after the fallback reveal still gets its note field.
+  let alignControls: (PageMetrics) -> Void = { pageMetrics in
+    let headerHeight = CGFloat(pageMetrics.headerHeight)
+    // Frame against the content view's current size, not the glass frame:
+    // NSGlassEffectView resizes its content view lazily, so it may still be
+    // the pre-measurement size here, and the strip's autoresizing mask
+    // carries it to the final width and the final top.
+    dragStripView.frame = NSRect(
+      x: 0, y: contentView.bounds.height - headerHeight, width: contentView.bounds.width,
+      height: headerHeight)
+    // The page and the glass share an origin and a scale, differing only
+    // in the Y axis: web rects grow downward from the top-left, AppKit
+    // frames upward from the bottom-left — hence the height flip. GLASS
+    // coordinates, not panel coordinates: the shadow margin sits between.
+    messageField.frame = NSRect(
+      x: pageMetrics.slot.x,
+      y: glassHostView.frame.height - (pageMetrics.slot.y + pageMetrics.slot.height),
+      width: pageMetrics.slot.width,
+      height: pageMetrics.slot.height
+    )
+    messageField.isHidden = false
+  }
+
+  // The panel stays offscreen until the page reports its rendered size, so
+  // it opens exactly content-sized instead of flashing full-size and
   // shrinking. The fallback timer covers a page that never finishes loading
-  // or a failed measurement: an approval panel must always appear,
-  // full-height if need be.
+  // or a failed measurement: an approval panel must always appear, at the
+  // minimum width and full height if need be (the page wraps to fit it).
   var panelRevealed = false
   let revealPanel: (PageMetrics?) -> Void = { pageMetrics in
     if panelRevealed { return }
     panelRevealed = true
+    var panelWidth = minimumPanelWidth
     var glassHeight = maxPanelHeight
     if let pageMetrics {
       panelWidth = max(minimumPanelWidth, min(CGFloat(pageMetrics.width).rounded(.up), maximumPanelWidth))
       glassHeight = min(maxPanelHeight, max(minPanelHeight, CGFloat(pageMetrics.height).rounded(.up)))
-      panel.setContentSize(NSSize(width: panelWidth + shadowMargin * 2, height: glassHeight + shadowMargin * 2))
-      glassHostView.frame = NSRect(x: shadowMargin, y: shadowMargin, width: panelWidth, height: glassHeight)
-      containerView.layer?.shadowPath = CGPath(
-        roundedRect: glassHostView.frame, cornerWidth: 14, cornerHeight: 14, transform: nil)
-      let headerHeight = CGFloat(pageMetrics.headerHeight)
-      // Frame against the content view's current size, not {panelWidth} and
-      // {glassHeight}: NSGlassEffectView resizes its content view lazily, so
-      // it may still be the pre-measurement size here, and the strip's
-      // autoresizing mask carries it to the final width and the final top.
-      dragStripView.frame = NSRect(
-        x: 0, y: contentView.bounds.height - headerHeight, width: contentView.bounds.width,
-        height: headerHeight)
-      // The page and the glass share an origin and a scale, differing only
-      // in the Y axis: web rects grow downward from the top-left, AppKit
-      // frames upward from the bottom-left — hence the height flip. GLASS
-      // coordinates, not panel coordinates: the shadow margin sits between.
-      messageField.frame = NSRect(
-        x: pageMetrics.slot.x,
-        y: glassHeight - (pageMetrics.slot.y + pageMetrics.slot.height),
-        width: pageMetrics.slot.width,
-        height: pageMetrics.slot.height
-      )
     }
+    panel.setContentSize(NSSize(width: panelWidth + shadowMargin * 2, height: glassHeight + shadowMargin * 2))
+    glassHostView.frame = NSRect(x: shadowMargin, y: shadowMargin, width: panelWidth, height: glassHeight)
+    containerView.layer?.shadowPath = CGPath(
+      roundedRect: glassHostView.frame, cornerWidth: 14, cornerHeight: 14, transform: nil)
     // The 24pt screen-corner margins apply to the visible GLASS edges; the
     // clear shadow margin around it must not push the panel further in.
     panel.setFrameOrigin(NSPoint(
@@ -470,7 +482,10 @@ func presentOverlay(for approvalRequest: ApprovalRequest) {
     // whole point of the non-activating design.
     panel.orderFrontRegardless()
   }
-  controller.pageMeasured = revealPanel
+  controller.pageMeasured = { pageMetrics in
+    revealPanel(pageMetrics)
+    if let pageMetrics { alignControls(pageMetrics) }
+  }
   DispatchQueue.main.asyncAfter(deadline: .now() + 1) { revealPanel(nil) }
 
   let timeoutSeconds = approvalRequest.timeoutSeconds ?? 300
