@@ -10,33 +10,51 @@
 // Overlays serialize: one pending panel at a time; later gated calls queue.
 
 import { spawn } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildApprovalHtml } from "./colorize.mjs";
 
 const DEFAULT_HELPER_PATH = fileURLToPath(
   new URL("../bin/airlock-approve", import.meta.url),
 );
+const HELPER_SOURCE_PATH = fileURLToPath(
+  new URL("../airlock-approve.swift", import.meta.url),
+);
+const HELPER_BUILD_COMMAND = "swiftc -O -o bin/airlock-approve airlock-approve.swift";
 
 // Injectable so tests substitute a fake helper and never display real panels.
 export function approvalHelperPath() {
   return process.env.AIRLOCK_APPROVE_HELPER || DEFAULT_HELPER_PATH;
 }
 
-// Startup diagnostic (loud stderr warning, not fatal): a missing or
-// non-executable helper otherwise surfaces only as "Not approved
-// (helper-unavailable)" on the first gated call, mid-workflow.
-export function approvalHelperStartupProblem() {
-  const helperPath = approvalHelperPath();
+// Setup diagnostic (a warning, never fatal): a missing or non-executable
+// helper otherwise surfaces only as "Not approved (helper-unavailable)" on
+// the first gated call, mid-workflow, and nothing rebuilds a helper older
+// than its source, so a pull that changes the overlay leaves the old panel
+// rendering the new approval page.
+export function approvalHelperProblem({ helperPath = approvalHelperPath(), sourcePath = HELPER_SOURCE_PATH } = {}) {
   try {
     accessSync(helperPath, constants.X_OK);
-    return null;
   } catch {
     return (
       `approval helper missing or not executable at ${helperPath} — every gated call will ` +
-      `return "Not approved (helper-unavailable)". Build it with: ` +
-      `swiftc -O -o bin/airlock-approve airlock-approve.swift`
+      `return "Not approved (helper-unavailable)". Build it with: ${HELPER_BUILD_COMMAND}`
     );
+  }
+  if (helperIsOlderThanSource(helperPath, sourcePath)) {
+    return (
+      `approval helper at ${helperPath} is older than ${sourcePath}, so its overlay may not ` +
+      `match this version of Airlock. Rebuild it with: ${HELPER_BUILD_COMMAND}`
+    );
+  }
+  return null;
+}
+
+function helperIsOlderThanSource(helperPath, sourcePath) {
+  try {
+    return statSync(helperPath).mtimeMs < statSync(sourcePath).mtimeMs;
+  } catch {
+    return false;
   }
 }
 
