@@ -112,11 +112,14 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
   /* Column layout capped at the viewport so a long command scrolls inside
      the <pre> while the footer stays pinned to the panel bottom. The width
      is the gutter plus the contract's ${COMMAND_COLUMNS} columns plus room
-     for the scrollbar and the right margin: the helper reads the body width
-     out of the rendered page and sizes the panel to it, so every approved
-     column is on screen without a fade or a clip. */
+     for the scrollbar and the right margin: the helper lays the page out
+     in its widest panel, reads the body width back, and shrinks the panel
+     to it, so every approved column is on screen without a fade or a clip.
+     Capped at the viewport too, so a narrower panel (a small screen, or a
+     stale helper binary with a fixed width) wraps the lines and keeps the
+     buttons in view instead of scrolling them off to the side. */
   body { display: flex; flex-direction: column; max-height: 100vh;
-         width: calc(2.5em + ${COMMAND_COLUMNS}ch + 66px); }
+         width: calc(2.5em + ${COMMAND_COLUMNS}ch + 66px); max-width: 100vw; }
   .head, .foot { flex: none; }
   /* The header doubles as the window's drag strip — unselectable, so WebKit
      passes its mouse-downs through to AppKit instead of starting a text
@@ -242,16 +245,20 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
       // The 👀 half of the split Approve: the helper opens the terminal on
       // the session, then records the decision as an approval.
       document.querySelector(".eyes").addEventListener("click", () => decide("watch"));
-      // Rows below the fold, from the scroll box's own geometry; the badge
-      // follows the scroll position and goes away at the end.
+      // Command lines reaching below the fold, counted per line so one that
+      // wraps in a narrow panel counts once; the badge follows the scroll
+      // position and goes away at the end.
       const codeBlock = document.querySelector("pre");
       const moreLines = document.getElementById("more-lines");
-      const rowHeight = parseFloat(getComputedStyle(codeBlock).lineHeight);
+      const commandLines = codeBlock.querySelectorAll(".ln");
       const updateMoreLines = () => {
-        const hiddenHeight = codeBlock.scrollHeight - codeBlock.clientHeight - codeBlock.scrollTop;
-        const hiddenRows = Math.round(hiddenHeight / rowHeight);
-        moreLines.hidden = hiddenRows <= 0;
-        moreLines.textContent = hiddenRows + " more line" + (hiddenRows === 1 ? "" : "s") + " below";
+        const foldBottom = codeBlock.getBoundingClientRect().top + codeBlock.clientTop + codeBlock.clientHeight;
+        let hiddenLines = 0;
+        for (const commandLine of commandLines) {
+          if (commandLine.getBoundingClientRect().bottom > foldBottom + 0.5) hiddenLines++;
+        }
+        moreLines.hidden = hiddenLines <= 0;
+        moreLines.textContent = hiddenLines + " more line" + (hiddenLines === 1 ? "" : "s") + " below";
       };
       codeBlock.addEventListener("scroll", updateMoreLines);
       window.addEventListener("resize", updateMoreLines);

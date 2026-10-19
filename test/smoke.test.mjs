@@ -420,7 +420,7 @@ describe("buildApprovalHtml", () => {
   it(`lays the page out at ${COMMAND_COLUMNS} columns with wrapping instead of a fade`, async () => {
     const html = await buildApprovalHtml({ command, badge: "test-shell", headerText: "Send?", timeoutSeconds: 30 });
     assert.doesNotMatch(html, /mask-image/);
-    assert.match(html, new RegExp(`width: calc\\(2\\.5em \\+ ${COMMAND_COLUMNS}ch \\+ 66px\\)`));
+    assert.match(html, new RegExp(`width: calc\\(2\\.5em \\+ ${COMMAND_COLUMNS}ch \\+ 66px\\); max-width: 100vw;`));
     assert.match(html, /\.ln \.c \{ white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;/);
     assert.match(html, /<span id="more-lines" hidden><\/span>/);
   });
