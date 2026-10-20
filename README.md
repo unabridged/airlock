@@ -23,6 +23,53 @@ human-readable command text. What the overlay shows is what the bridge sends;
 the known cases where that can be made to differ from what the remote shell
 executes are tracked in [SECURITY.md](SECURITY.md).
 
+## Quick install
+
+You need macOS 26 or later on Apple silicon, an admin account, and Claude
+Code.
+
+**With Claude Code:** paste this into a session, and it asks which hosts to
+add and whether to block direct SSH. While the repository is private, log in
+with `gh auth login` first.
+
+```text
+Read https://github.com/unabridged/airlock/blob/main/docs/agent-install.md (if the page is not found, read it with gh) and guide me through installing this tool. Ask me about configuration choices, show changes before applying them, and have me execute privileged commands myself.
+```
+
+**By hand:**
+
+1. Install the package. While the repository is private, use the
+   [direct package](#direct-package) instead.
+
+   ```bash
+   brew tap unabridged/airlock https://github.com/unabridged/airlock
+   ```
+
+   ```bash
+   brew install --cask unabridged/airlock/airlock
+   ```
+
+2. Create the config from the example and set your targets
+   ([Configure](#configure)):
+
+   ```bash
+   sudo cp /usr/local/libexec/airlock/config.example.json /usr/local/libexec/airlock/config.json
+   ```
+
+   ```bash
+   sudo -e /usr/local/libexec/airlock/config.json
+   ```
+
+3. Register the server:
+
+   ```bash
+   claude mcp add --scope user airlock -- /usr/local/libexec/airlock/bin/airlock-server
+   ```
+
+4. [Block the direct path](#block-the-direct-path): add the
+   [deny rules](#example-claude-settingsjson-entry) and deny the hosts in
+   Claude Code's sandbox.
+
 ## Using it
 
 Agent sees five tools:
@@ -102,102 +149,6 @@ anything.
 Airlock installs as a macOS package into `/usr/local/libexec/airlock`, owned by
 root, with its own Node and tmux. Replace `X.Y.Z` below with the release
 version.
-
-### Guided install with Claude Code
-
-Claude Code can run the install for you: it reads this README, asks what the
-targets are, writes and validates the config, adds the permission rules, and
-registers the server. It needs the GitHub CLI (`gh`), logged in to an account
-that can see this repository. You still run the commands that need `sudo`
-(the installer and the config install) when it hands them to you, because
-the agent cannot type your password. Paste this into Claude Code:
-
-```text
-Install Airlock, the human-gated remote terminal bridge for Claude Code, from
-https://github.com/unabridged/airlock. Its README is the instruction set.
-Run gh auth status first; if gh is missing, not logged in, or cannot fetch
-the README, stop and tell me to install gh and run gh auth login myself.
-Fetch the README with
-gh api repos/unabridged/airlock/contents/README.md -H 'Accept: application/vnd.github.raw'
-and read the sections Install, Configure, Register, Moving from a checkout
-install, and Block the direct path before doing anything. I run every
-command that needs sudo myself: print it in a bash block, say what it does,
-and wait until I say it finished. Never run ssh, scp, or sftp, and never
-read ~/.ssh/config: ask me for Host alias names instead.
-
-1. Requirements. Check macOS 26 or later on Apple silicon, and that /usr and
-   /usr/local (and /usr/local/libexec if it exists; the installer creates it
-   otherwise) are root-owned directories, not symlinks, not group- or
-   other-writable, without an ACL entry that allows writes
-   (ls -led /usr /usr/local /usr/local/libexec). Stop and report anything
-   missing.
-
-2. Install. If gh repo view unabridged/airlock --json isPrivate says the
-   repository is private, Homebrew cannot download the package: download the
-   latest release's package with gh release download into a new empty
-   directory and give me the sudo installer command from the README.
-   Otherwise check for Homebrew, tap the repository, and give me
-   brew install --cask unabridged/airlock/airlock to run, since the package
-   install asks for my password. Confirm the install with
-   pkgutil --pkg-info com.unabridgedsoftware.airlock.
-
-3. Configure. If ~/.config/airlock/config.json exists (a checkout install),
-   ask me whether to carry it over: if so, read it, list every target, its
-   script, and the ssh_config path for my review as the README's Moving
-   section asks, validate it with the loader command below, and skip the
-   questions. Otherwise ask me these questions, one at a time:
-   - Which applications and environments (staging, production, ...) I
-     reach, and how each is reached: an SSH Host alias from my SSH config,
-     or a local connection script (its absolute path, its arguments, and
-     the commands it runs underneath, such as aws ecs execute-command and
-     session-manager-plugin, so that step 4 can deny them too).
-   - For each, whether I want a shell target, a Rails console target (and
-     its startup lines, such as cd myapp and bin/rails console), or both.
-   - A one-line description per target, with the hostname: Claude picks a
-     target from these descriptions in list_targets, while the approval
-     overlay shows only the target name and its display_command.
-   - Whether my SSH config is at ~/.ssh/config, and whether to keep the
-     example's instructions text or change it.
-   Draft config.json from /usr/local/libexec/airlock/config.example.json
-   with targets named <app>-<environment>-<shell|console>, each
-   display_command exactly the ssh or script line followed by each startup
-   line, as the README requires. Write the draft to a temporary file and
-   validate it with
-   /usr/local/libexec/airlock/runtime/bin/node --input-type=module -e 'import { loadConfig } from "/usr/local/libexec/airlock/src/config.mjs"; loadConfig(process.argv[1])' DRAFT
-   until it reports nothing. The loader always reads the SSH config file,
-   even when no target uses SSH: if it does not exist, have me create it
-   empty with mkdir -p ~/.ssh && touch ~/.ssh/config. Show me the final
-   file, then give me
-   sudo install -m 644 -o root -g wheel DRAFT /usr/local/libexec/airlock/config.json
-   and wait.
-
-4. Block the direct path. Ask me whether to add the deny rules from the
-   README's example settings.json to my user settings,
-   ~/.claude/settings.json, with my script targets' paths and the commands
-   they wrap in place of the example's, plus the absolute-path forms
-   /usr/bin/ssh, /usr/bin/scp, /usr/bin/sftp, /opt/homebrew/bin/tmux,
-   /usr/local/bin/tmux, and the bundled
-   /usr/local/libexec/airlock/runtime/bin/tmux. Merge them into the
-   existing permissions.deny list without removing anything, show me the
-   diff, and remind me that the rules are policy and the sandbox still has
-   to cut off the hosts.
-
-5. Register. Run claude mcp get airlock first (use "$CLAUDE_CODE_EXECPATH"
-   when claude is not on PATH). If a registration exists, such as a
-   checkout's node .../src/server.mjs, show it to me and remove it with
-   claude mcp remove --scope user airlock once I agree, because add refuses
-   an existing name. Then run
-   claude mcp add --scope user airlock -- /usr/local/libexec/airlock/bin/airlock-server
-   then claude mcp get airlock, and report its status. If I ask for the
-   managed registration instead, do not run claude mcp add: point me to
-   the README's Managed registration section, and tell me that file needs
-   sudo and that every MCP server it does not list stops loading. Do not
-   add a CLAUDE.md entry; the config's instructions cover it.
-
-Finish with a short summary: what was installed, where the config lives,
-which rules were added, and that the airlock tools appear in the next
-Claude Code session.
-```
 
 ### Homebrew
 
