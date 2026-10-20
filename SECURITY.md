@@ -200,12 +200,15 @@ Residual risks:
   for example through passwordless `sudo`.
 - The check runs once, at startup. A non-root user cannot change root-owned
   files afterwards, but nothing re-verifies a running server.
-- The package trusts its build machine: the Homebrew tmux and libraries it
-  bundles, the working tree it copies the server from (uncommitted changes
-  included), and the npm registry. Only Node is pinned, to the version in
-  `.tool-versions` and the OpenJS Foundation's Developer ID signature. The
-  package is unsigned unless built with `--sign`. The cask's SHA-256 pins the
-  release asset for Homebrew; a direct download has nothing to check against.
+- The package trusts its build machine's toolchain (git, the Xcode tools,
+  `pkgbuild`) and the Homebrew bottles `packaging/runtime.lock` was first
+  recorded from. The build stages only a committed tree, copied byte for byte
+  from git's objects, bundles only the Homebrew files whose versions and
+  SHA-256 checksums the lock pins, takes Node only as the OpenJS
+  Foundation-signed build of the version in `.tool-versions`, and installs npm
+  packages only as `package-lock.json` pins them. The package is unsigned unless built with `--sign`. The cask's SHA-256
+  pins the release asset for Homebrew; a direct download has nothing to check
+  against.
 - A development instance runs from the writable checkout and protects nothing.
 
 ### Risk

@@ -1,0 +1,14 @@
+# The Homebrew files bin/build-pkg bundles as the package's tmux runtime and
+# its license texts, one per line: formula, version, path inside the keg, and
+# SHA-256. The build fails unless the files it bundles from the build
+# machine's Homebrew are exactly these. To move to another version, upgrade it
+# with Homebrew, run bin/build-pkg, check the versions it reports, and replace
+# these entries with the ones it prints.
+libevent 2.1.12_1 LICENSE ff02effc9b331edcdac387d198691bfa3e575e7d244ad10cb826aa51ef085670
+libevent 2.1.12_1 lib/libevent_core-2.1.7.dylib 4cf8da116fdb8f2ba51d7117aa1cab30bc0c6a929142592f876f106091883f95
+ncurses 6.6 COPYING 708999f95527e1ffa670c6fce288c6c600cb477dd04afcc1171422b3dd4ee226
+ncurses 6.6 lib/libncursesw.6.dylib c3881a5cfce214efe54744a4664f18b7cea5caa86ff87e0231244809c1386a50
+tmux 3.4_1 COPYING c031bd37f464c534277814f6aa38686fa023d094261d57fd2545ad592bb53ccd
+tmux 3.4_1 bin/tmux a31d09000aa2d9eeb0c2df2ea771b7310358b1fe6caac00f8b08a7018b5a1c59
+utf8proc 2.9.0 LICENSE.md 3b510150d34f248a221bb88e1d811238d6c6c18b51231822c42974c39bb07256
+utf8proc 2.9.0 lib/libutf8proc.3.dylib 465196da8c5b8b7b30aa11afe826e78d782f0de00997305144f116b5ef70a586
