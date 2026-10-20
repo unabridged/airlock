@@ -7,7 +7,8 @@
 // (a real C-c via send-keys is the single, deliberate exception).
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -22,25 +23,97 @@ const PANE_WIDTH = 200;
 const PANE_HEIGHT = 50;
 const HISTORY_LIMIT = 50000;
 
-// The bridge server's own config, passed via -f on every invocation. tmux
-// fixes a pane's history limit at window creation (a post-creation
-// set-option is a no-op for the existing pane — verified on tmux 3.4), so
-// the limit must already be the global default when new-session starts the
-// server. -f also stops the bridge server from reading the user's own
-// ~/.tmux.conf (verified: without it, the user's history-limit leaked in).
-// The terminal-overrides line strips the alternate-screen capability from
-// every attaching client's terminal, so tmux paints the watcher's window in
-// its primary buffer (real scrollback, no restore-on-exit). That alone does
-// NOT preserve content at session end: the tmux client clears the screen
-// unconditionally in its tty restore at exit (ESC[H ESC[2J — verified by
-// recording a client's bytes), so the attach scripts repaint the
-// bridge-saved final screen afterwards — see {Tmux#saveFinalScreen} and
-// {watchCommandContent}.
-const CONF_CONTENT = `set-option -g history-limit ${HISTORY_LIMIT}
-set-option -ga terminal-overrides ',*:smcup@:rmcup@'
-`;
+// The bridge server's own options, set in the same invocation as the
+// new-session that may start the server. tmux fixes a pane's history limit
+// at window creation (a post-creation set-option is a no-op for the existing
+// pane — verified on tmux 3.4), so the limit must already be the global
+// default when new-session creates the window. The terminal-overrides entry
+// strips the alternate-screen capability from every attaching client's
+// terminal, so tmux paints the watcher's window in its primary buffer (real
+// scrollback, no restore-on-exit). That alone does NOT preserve content at
+// session end: the tmux client clears the screen unconditionally in its tty
+// restore at exit (ESC[H ESC[2J — verified by recording a client's bytes), so
+// the attach scripts repaint the bridge-saved final screen afterwards — see
+// {Tmux#saveFinalScreen} and {watchCommandContent}.
+const SERVER_OPTION_COMMANDS = [
+  ...["set-option", "-g", "history-limit", String(HISTORY_LIMIT), ";"],
+  ...["set-option", "-g", "terminal-overrides", ",*:smcup@:rmcup@", ";"],
+];
+
+// Every invocation names this config file, which stops the bridge server
+// from reading the user's own ~/.tmux.conf (verified: without it, the user's
+// history-limit leaked in).
+const EMPTY_CONFIG_PATH = "/dev/null";
+
+// The arguments every tmux invocation starts with, the attach scripts'
+// included. tmux reads -f only in the invocation that starts the server, and
+// attach-session starts one when none is running (a session that ends after
+// a watcher's has-session check), so no call may leave the config out.
+function serverArguments(socketPath) {
+  return ["-S", socketPath, "-f", EMPTY_CONFIG_PATH];
+}
+
+// tmux ends a command at any argument that ends in ";", even after "--", and
+// reads a trailing "\;" as a literal ";". Escaping that last character hands
+// new-session its command argv verbatim, so no argument of a target can
+// start a tmux command of its own.
+function escapeTrailingCommandSeparator(argument) {
+  return argument.endsWith(";") ? `${argument.slice(0, -1)}\\;` : argument;
+}
+
+// The terminal the attach scripts fall back to when the bundled tmux's
+// terminfo directory has no entry for the human's TERM.
+const FALLBACK_TERMINAL = "xterm-256color";
 
 const TMUX_CANDIDATES = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "tmux"];
+
+// Wraps `word` in single quotes for a POSIX shell, whatever it contains.
+export function shellQuote(word) {
+  return `'${word.replaceAll("'", "'\\''")}'`;
+}
+
+// The tmux a development instance runs: the first Homebrew install found,
+// else whatever `tmux` the PATH resolves.
+export function defaultTmuxExecutable() {
+  return TMUX_CANDIDATES.find((candidate) => candidate === "tmux" || existsSync(candidate)) ?? "tmux";
+}
+
+// Replaces `path` with a new file holding `content`. The content goes to a
+// fresh file beside it (O_EXCL, so nothing planted there is written through)
+// that is then renamed over `path`, which swaps the directory entry, a
+// symlink included, without following it. Concurrent writers each rename a
+// whole file, so the last one wins.
+export function replaceFile(path, content, mode) {
+  const temporaryPath = `${path}.${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    writeFileSync(temporaryPath, content, { mode, flag: "wx" });
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+// The `NAME='value' ` prefix that hands `environment` to a shell command.
+function environmentPrefix(environment) {
+  return Object.entries(environment)
+    .map(([name, value]) => `${name}=${shellQuote(value)} `)
+    .join("");
+}
+
+// The zsh lines that switch TERM to {FALLBACK_TERMINAL} unless the TERMINFO
+// directory in `environment` holds an entry for it. The attaching client's
+// ncurses searches $TERMINFO first, so a hit there ends its lookup before
+// ~/.terminfo, $TERMINFO_DIRS, or its own Homebrew prefix, all writable by
+// the user.
+function terminalFallbackLines(environment) {
+  if (!environment.TERMINFO) return "";
+  const entryPath = `${shellQuote(environment.TERMINFO)}/$(printf %02x "'\${TERM[1]}")/$TERM`;
+  return `if [[ $TERM == */* || ! -f ${entryPath} ]]; then
+  export TERM=${FALLBACK_TERMINAL}
+fi
+`;
+}
 
 // One-shot attach script for the approval overlay's 👀 button: the helper
 // hands it to /usr/bin/open, Terminal runs it, and it attaches to the bridge
@@ -48,24 +121,24 @@ const TMUX_CANDIDATES = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "tmux"
 // AFTER approval — at 👀-press time the session may not exist yet. The
 // escape sequence resizes the Terminal window to the pinned pane geometry so
 // the attach shows the full pane instead of a shrunken reflow.
-function watchCommandContent(tmuxExecutable, socketPath, sessionName, finalScreenPath) {
-  const quote = (word) => `'${word.replaceAll("'", "'\\''")}'`;
-  const tmuxArgv = `${quote(tmuxExecutable)} -S ${quote(socketPath)}`;
+function watchCommandContent({ executable, environment, socketPath, sessionName, finalScreenPath }) {
+  const tmuxWords = [executable, ...serverArguments(socketPath)].map(shellQuote);
+  const tmuxArgv = `${environmentPrefix(environment)}${tmuxWords.join(" ")}`;
   return `#!/bin/zsh
 # Airlock — one-shot attach for the approval overlay's eyes button.
 # Generated by src/tmux.mjs; regenerated on every bridge start. Do not edit.
 printf '\\033[8;${PANE_HEIGHT};${PANE_WIDTH}t'
-for _ in {1..100}; do
-  if ${tmuxArgv} has-session -t ${quote(sessionName)} 2>/dev/null; then
-    ${tmuxArgv} attach-session -t ${quote(sessionName)}
+${terminalFallbackLines(environment)}for _ in {1..100}; do
+  if ${tmuxArgv} has-session -t ${shellQuote(sessionName)} 2>/dev/null; then
+    ${tmuxArgv} attach-session -t ${shellQuote(sessionName)}
     # The tmux client clears the screen unconditionally when it exits, even
     # with the alternate screen suppressed. The bridge saves the pane's final
     # screen right before closing the session (and deletes it when a new
     # session starts), so a present file means this attach just ended in a
     # close — repaint it so the rendered session content survives.
-    if [[ -f ${quote(finalScreenPath)} ]]; then
+    if [[ -f ${shellQuote(finalScreenPath)} ]]; then
       printf '\\033[H\\033[2J'
-      cat -- ${quote(finalScreenPath)}
+      cat -- ${shellQuote(finalScreenPath)}
       printf '\\n[airlock] session closed — its final screen is restored above.\\n'
     fi
     # Never exit: the terminal may close the window when its command ends
@@ -101,13 +174,12 @@ export function ensureStateDirectory() {
   ensurePrivateDirectory(STATE_DIRECTORY);
 }
 
-function tmuxBinary() {
-  return TMUX_CANDIDATES.find((candidate) => candidate === "tmux" || existsSync(candidate)) ?? "tmux";
-}
-
-function run(executable, argv, { input } = {}) {
+function run(executable, argv, { input, environment = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, argv, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(executable, argv, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...environment },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => (stdout += chunk));
@@ -131,38 +203,57 @@ function run(executable, argv, { input } = {}) {
 }
 
 export class Tmux {
-  // The bridge-owned config file lives next to the socket, so a Tmux pointed
-  // at a test socket in a temp directory never touches the real state dir.
-  constructor({ socketPath = SOCKET_PATH, sessionName = SESSION_NAME } = {}) {
+  // The Tmux a launch runs: its socket in the launch's state directory, and
+  // the launch's tmux executable and environment.
+  static forLaunch({ stateDirectory, tmuxExecutable, tmuxEnvironment }) {
+    return new Tmux({
+      socketPath: join(stateDirectory, "tmux.sock"),
+      executable: tmuxExecutable,
+      environment: tmuxEnvironment,
+    });
+  }
+
+  // The bridge-owned files live next to the socket, so a Tmux pointed at a
+  // test socket in a temp directory never touches the real state dir.
+  // `environment` is merged over the bridge's own for every tmux it runs,
+  // including the one the watch script starts.
+  constructor({
+    socketPath = SOCKET_PATH,
+    sessionName = SESSION_NAME,
+    executable = defaultTmuxExecutable(),
+    environment = {},
+  } = {}) {
     this.socketPath = socketPath;
     this.sessionName = sessionName;
-    this.confPath = join(dirname(socketPath), "tmux.conf");
-    // The -f config file must exist before the first tmux invocation, in a
-    // 0700 directory (the private socket lives beside it).
+    this.executable = executable;
+    this.environment = environment;
+    // The private socket lives in a 0700 directory, beside the files below.
     ensurePrivateDirectory(dirname(socketPath));
-    writeFileSync(this.confPath, CONF_CONTENT, { mode: 0o600 });
     // The pane's rendered screen, saved by {Tmux#saveFinalScreen} just before
     // a close and repainted by the attach scripts after their tmux client
     // exits (which clears the terminal unconditionally).
     this.finalScreenPath = join(dirname(socketPath), "final-screen");
     // The overlay's 👀 button opens this via /usr/bin/open. Values are baked
-    // in at write time; the explicit chmod keeps the executable bit on a file
-    // surviving from an earlier run (writeFileSync's mode applies only when
-    // it creates the file).
+    // in at write time.
     this.watchCommandPath = join(dirname(socketPath), "watch.command");
-    writeFileSync(
+    replaceFile(
       this.watchCommandPath,
-      watchCommandContent(tmuxBinary(), socketPath, sessionName, this.finalScreenPath),
-      { mode: 0o700 },
+      watchCommandContent({
+        executable,
+        environment,
+        socketPath,
+        sessionName,
+        finalScreenPath: this.finalScreenPath,
+      }),
+      0o700,
     );
-    chmodSync(this.watchCommandPath, 0o700);
   }
 
   command(argv, options) {
-    // -f matters only when this invocation starts the server; passing it
-    // everywhere keeps the bridge server on its own config regardless of
-    // which call happens to start it.
-    return run(tmuxBinary(), ["-S", this.socketPath, "-f", this.confPath, ...argv], options);
+    return run(this.executable, [...serverArguments(this.socketPath), ...argv], {
+      ...options,
+      environment: this.environment,
+    });
   }
 
   // Creates the session with `commandArgv` as the pane's DIRECT command (no
@@ -175,6 +266,7 @@ export class Tmux {
     // so it must be gone before a new session accepts watchers.
     rmSync(this.finalScreenPath, { force: true });
     await this.command([
+      ...SERVER_OPTION_COMMANDS,
       "new-session",
       "-d",
       "-s",
@@ -184,11 +276,11 @@ export class Tmux {
       "-y",
       String(PANE_HEIGHT),
       "--",
-      ...commandArgv,
+      ...commandArgv.map(escapeTrailingCommandSeparator),
     ]);
     // Unmistakable, geometry-stable bridge server (PLAN: Bridge state
     // security). history-limit is NOT set here: it only takes effect at
-    // window creation, so it lives in the -f config file above.
+    // window creation, so {SERVER_OPTION_COMMANDS} sets it with new-session.
     await this.command(["set-option", "-t", this.sessionName, "status", "off"]);
     await this.command(["set-option", "-t", this.sessionName, "detach-on-destroy", "on"]);
     await this.command(["set-window-option", "-t", this.sessionName, "window-size", "manual"]);
@@ -268,7 +360,7 @@ export class Tmux {
   async saveFinalScreen() {
     try {
       const { stdout } = await this.command(["capture-pane", "-p", "-e", "-t", this.sessionName]);
-      writeFileSync(this.finalScreenPath, stdout, { mode: 0o600 });
+      replaceFile(this.finalScreenPath, stdout, 0o600);
     } catch {
       // Missing session or unwritable state directory: the repaint is a
       // nicety, never worth blocking the close over.

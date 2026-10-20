@@ -1,0 +1,59 @@
+#!/bin/sh -p
+# Airlock — package preinstall script. The installer runs it as root before
+# it lays the payload down under /usr/local/libexec/airlock.
+#
+# It fails closed before touching anything: a symlinked, non-root-owned, or
+# group- or other-writable directory on the way to the install root, or one
+# whose access control list allows changing it, would let a non-root user
+# redirect or replace what the root-owned install trusts.
+# It then removes the previous payload so files a newer version no longer
+# ships do not linger. The admin's config.json is never removed.
+set -eu
+
+INSTALL_ROOT=/usr/local/libexec/airlock
+# An entry line of `ls -le` that grants a right to change the directory or,
+# through inheritance, the files the installer creates in it.
+MUTATING_ACCESS_CONTROL_ENTRY='^ *[0-9]+: .* allow ([a-z_]+,)*(write|append|delete|writeattr|writeextattr|writesecurity|chown|add_file|add_subdirectory|delete_child)(,|$)'
+
+refuse() {
+  printf '%s\n' "Airlock preinstall: $1" "Airlock was not installed; nothing was changed." >&2
+  exit 1
+}
+
+# The installer passes the target volume as the third argument.
+target_volume=${3:-/}
+if [ "$target_volume" != "/" ]; then
+  refuse "Airlock installs only on the startup volume, not $target_volume."
+fi
+
+for directory in /usr /usr/local /usr/local/libexec "$INSTALL_ROOT"; do
+  if [ -L "$directory" ]; then
+    refuse "$directory is a symlink."
+  fi
+  if [ ! -e "$directory" ]; then
+    continue
+  fi
+  if [ ! -d "$directory" ]; then
+    refuse "$directory is not a directory."
+  fi
+  if /bin/ls -led -- "$directory" | /usr/bin/grep -Eq "$MUTATING_ACCESS_CONTROL_ENTRY"; then
+    refuse "$directory has an access control entry that allows changing it."
+  fi
+  owner_uid=$(/usr/bin/stat -f %u "$directory")
+  permission_bits=$(/usr/bin/stat -f %Lp "$directory")
+  if [ "$owner_uid" != 0 ]; then
+    refuse "$directory is owned by uid $owner_uid, not root."
+  fi
+  if [ $((0$permission_bits & 020)) -ne 0 ]; then
+    refuse "$directory is group-writable."
+  fi
+  if [ $((0$permission_bits & 002)) -ne 0 ]; then
+    refuse "$directory is other-writable."
+  fi
+done
+
+if [ -d "$INSTALL_ROOT" ]; then
+  for entry in bin src node_modules runtime package.json package-lock.json config.example.json; do
+    /bin/rm -rf -- "$INSTALL_ROOT/$entry"
+  done
+fi

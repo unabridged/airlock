@@ -1,11 +1,13 @@
 {
   "name": "airlock",
+  "version": "1.0.0",
   "description": "Human-gated remote terminal bridge (MCP server). Experimental: an approval gate, not a security boundary.",
   "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:package": "AIRLOCK_PACKAGE_TEST=1 node --test test/package.test.mjs"
   },
   "dependencies": {
     "shiki": "^3.0.0"

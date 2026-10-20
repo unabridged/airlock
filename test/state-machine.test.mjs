@@ -5,14 +5,26 @@
 // against it — no real tmux server, no SSH, no approval panels.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, beforeEach, describe, it } from "node:test";
+import { after, beforeEach, describe, it, mock } from "node:test";
 
 import { acquireSessionLock, SessionManager, SessionStateError } from "../src/session-manager.mjs";
-import { Tmux } from "../src/tmux.mjs";
+import { defaultTmuxExecutable, replaceFile, shellQuote, Tmux } from "../src/tmux.mjs";
 
 const PROMPT = "fake$ ";
 
@@ -163,6 +175,17 @@ describe("SessionManager — one active session", () => {
     assert.deepEqual(tmux.launchArgv, ["/usr/bin/true"]);
     await assert.rejects(sessionManager.open("fake-shell"), /already open/);
     assert.ok(existsSync(join(stateDirectory, "session.json")));
+  });
+
+  it("replaces a symlink planted at the session state file instead of writing through it", async () => {
+    const targetPath = join(stateDirectory, "target");
+    writeFileSync(targetPath, "untouched\n");
+    symlinkSync(targetPath, join(stateDirectory, "session.json"));
+    const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
+    await sessionManager.open("fake-shell");
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+    const sessionState = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
+    assert.equal(sessionState.target, "fake-shell");
   });
 
   it("sends a command and returns only its output (echo and prompt stripped)", async () => {
@@ -333,6 +356,14 @@ describe("SessionManager — cross-bridge session lock", () => {
   function assertLockFree() {
     acquireSessionLock(stateDirectory)();
   }
+
+  it("refuses a symlink planted at the lock file instead of locking its target", () => {
+    const targetPath = join(stateDirectory, "target");
+    writeFileSync(targetPath, "untouched\n");
+    symlinkSync(targetPath, lockFile);
+    assert.throws(() => acquireSessionLock(stateDirectory), { code: "ELOOP" });
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+  });
 
   it("holds the kernel lock while open, releases on close, and can reopen", async () => {
     const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
@@ -708,5 +739,267 @@ describe("Tmux — killSession strictness", () => {
     };
     await tmux.killSession();
     assert.equal(await tmux.hasSession(), false);
+  });
+});
+
+describe("Tmux — executable and environment", () => {
+  function writeRecordingTmux(directory) {
+    const recordPath = join(directory, "record");
+    const executable = join(directory, "fake tmux");
+    writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' "TERMINFO=$TERMINFO" "HOME=$HOME" "$@" > '${recordPath}'\n`);
+    chmodSync(executable, 0o755);
+    return { executable, recordPath };
+  }
+
+  it("runs the given executable with its environment merged over the bridge's", async () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const { executable, recordPath } = writeRecordingTmux(directory);
+    const socketPath = join(directory, "tmux.sock");
+    const tmux = new Tmux({ socketPath, executable, environment: { TERMINFO: "/usr/share/terminfo" } });
+    await tmux.command(["list-sessions"]);
+    assert.deepEqual(readFileSync(recordPath, "utf8").split("\n"), [
+      "TERMINFO=/usr/share/terminfo",
+      `HOME=${process.env.HOME}`,
+      "-S",
+      socketPath,
+      "-f",
+      "/dev/null",
+      "list-sessions",
+      "",
+    ]);
+    assert.ok(!readdirSync(directory).includes("tmux.conf"));
+  });
+
+  it("bakes the executable and its environment into the watch script", () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const { executable } = writeRecordingTmux(directory);
+    const socketPath = join(directory, "tmux.sock");
+    const tmux = new Tmux({ socketPath, executable, environment: { TERMINFO: "/usr/share/terminfo" } });
+    const watchScript = readFileSync(tmux.watchCommandPath, "utf8");
+    assert.ok(
+      watchScript.includes(
+        `if TERMINFO='/usr/share/terminfo' '${executable}' '-S' '${socketPath}' '-f' '/dev/null' has-session -t 'airlock'`,
+      ),
+      watchScript,
+    );
+    assert.ok(
+      watchScript.includes(
+        `TERMINFO='/usr/share/terminfo' '${executable}' '-S' '${socketPath}' '-f' '/dev/null' attach-session`,
+      ),
+      watchScript,
+    );
+  });
+
+  it("leaves the watch script's tmux bare without an environment", () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const { executable } = writeRecordingTmux(directory);
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock"), executable });
+    const watchScript = readFileSync(tmux.watchCommandPath, "utf8");
+    assert.match(watchScript, new RegExp(`\\n  if '${executable}' '-S' `));
+    assert.ok(!watchScript.includes("TERM="), watchScript);
+  });
+
+  // A tmux stand-in that records the TERM it runs with, then ends the watch
+  // script that started it.
+  function writeTerminalRecordingTmux(directory) {
+    const recordPath = join(directory, "terminal");
+    const executable = join(directory, "terminal tmux");
+    writeFileSync(executable, `#!/bin/sh\nprintf '%s' "$TERM" > '${recordPath}'\nkill $PPID\n`);
+    chmodSync(executable, 0o755);
+    return { executable, recordPath };
+  }
+
+  function watchScriptTerminal(environment, terminal) {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const { executable, recordPath } = writeTerminalRecordingTmux(directory);
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock"), executable, environment });
+    spawnSync("/bin/zsh", [tmux.watchCommandPath], { env: { ...process.env, TERM: terminal } });
+    return readFileSync(recordPath, "utf8");
+  }
+
+  it("keeps a TERM the watch script's TERMINFO directory describes", () => {
+    assert.equal(watchScriptTerminal({ TERMINFO: "/usr/share/terminfo" }, "vt100"), "vt100");
+  });
+
+  it("falls back to xterm-256color for a TERM the TERMINFO directory lacks", () => {
+    const environment = { TERMINFO: "/usr/share/terminfo" };
+    assert.equal(watchScriptTerminal(environment, "airlock-unlisted"), "xterm-256color");
+    assert.equal(watchScriptTerminal(environment, "../76/vt100"), "xterm-256color");
+    assert.equal(watchScriptTerminal(environment, ""), "xterm-256color");
+  });
+
+  it("leaves TERM alone without a TERMINFO directory", () => {
+    assert.equal(watchScriptTerminal({}, "airlock-unlisted"), "airlock-unlisted");
+  });
+
+  it("replaces a symlink planted at the watch script instead of writing through it", () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const { executable } = writeRecordingTmux(directory);
+    const targetPath = join(directory, "target");
+    writeFileSync(targetPath, "untouched\n");
+    symlinkSync(targetPath, join(directory, "watch.command"));
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock"), executable });
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+    assert.match(readFileSync(tmux.watchCommandPath, "utf8"), /^#!\/bin\/zsh\n/);
+  });
+
+  it("replaces a symlink planted at the final screen instead of writing through it", async () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const executable = join(directory, "screen tmux");
+    writeFileSync(executable, "#!/bin/sh\nprintf 'final screen\\n'\n");
+    chmodSync(executable, 0o755);
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock"), executable });
+    const targetPath = join(directory, "target");
+    writeFileSync(targetPath, "untouched\n");
+    symlinkSync(targetPath, tmux.finalScreenPath);
+    await tmux.saveFinalScreen();
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+    assert.equal(readFileSync(tmux.finalScreenPath, "utf8"), "final screen\n");
+  });
+
+  // A tmux that tells has-session the session exists, as when the session
+  // ends between the watch script's check and its attach, runs the real tmux
+  // for everything else, and then ends the script that started it.
+  function writeRacingTmux(directory) {
+    const executable = join(directory, "racing tmux");
+    writeFileSync(
+      executable,
+      `#!/bin/sh
+case " $* " in *" has-session "*) exit 0 ;; esac
+${shellQuote(defaultTmuxExecutable())} "$@"
+kill $PPID
+`,
+    );
+    chmodSync(executable, 0o755);
+    return executable;
+  }
+
+  it("starts no server on the user's tmux config when the session ends before the attach", async () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const socketPath = join(directory, "tmux.sock");
+    const tmux = new Tmux({ socketPath, executable: writeRacingTmux(directory) });
+    // This config keeps a server without sessions running, so a server that
+    // read it outlives the failed attach that started it.
+    const homeDirectory = join(directory, "home");
+    mkdirSync(homeDirectory);
+    writeFileSync(join(homeDirectory, ".tmux.conf"), "set -g exit-empty off\n");
+    const environment = { ...process.env, HOME: homeDirectory, XDG_CONFIG_HOME: join(homeDirectory, ".config") };
+    delete environment.TMUX;
+    const serverArgv = ["-S", socketPath, "-f", "/dev/null"];
+    try {
+      spawnSync("/bin/zsh", [tmux.watchCommandPath], { env: environment, stdio: "ignore", timeout: 10_000 });
+      let serverRunning = true;
+      for (let attempt = 0; attempt < 20 && serverRunning; attempt += 1) {
+        await sleep(100);
+        serverRunning =
+          spawnSync(defaultTmuxExecutable(), [...serverArgv, "show-options", "-g", "exit-empty"]).status === 0;
+      }
+      assert.equal(serverRunning, false);
+    } finally {
+      spawnSync(defaultTmuxExecutable(), [...serverArgv, "kill-server"]);
+    }
+  });
+});
+
+describe("Tmux — server options", () => {
+  it("starts the bridge server with its history limit and no alternate screen", async () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock") });
+    try {
+      await tmux.createSession(["sleep", "30"]);
+      const { stdout: historyLimit } = await tmux.command([
+        "display-message",
+        "-p",
+        "-t",
+        "airlock",
+        "#{history_limit}",
+      ]);
+      assert.equal(historyLimit, "50000\n");
+      const { stdout: terminalOverrides } = await tmux.command(["show-options", "-g", "-v", "terminal-overrides"]);
+      assert.equal(terminalOverrides, "*:smcup@:rmcup@\n");
+    } finally {
+      await tmux.command(["kill-server"]).catch(() => {});
+    }
+  });
+
+  it("hands the pane its command arguments verbatim, semicolons included", async () => {
+    const directory = mkdtempSync(join(scratch, "tmuxdir-"));
+    const tmux = new Tmux({ socketPath: join(directory, "tmux.sock") });
+    const argumentsPath = join(directory, "arguments");
+    const markerPath = join(directory, "marker");
+    const paneArguments = ["b\\;", "a;", "run-shell", `touch ${shellQuote(markerPath)}`];
+    try {
+      await tmux.createSession([
+        "/bin/sh",
+        "-c",
+        `printf '%s\\n' "$@" > "$0.partial"; mv "$0.partial" "$0"; sleep 30`,
+        argumentsPath,
+        ...paneArguments,
+      ]);
+      for (let attempt = 0; attempt < 50 && !existsSync(argumentsPath); attempt += 1) await sleep(100);
+      assert.deepEqual(readFileSync(argumentsPath, "utf8").split("\n").slice(0, -1), paneArguments);
+      assert.equal(existsSync(markerPath), false);
+    } finally {
+      await tmux.command(["kill-server"]).catch(() => {});
+    }
+  });
+});
+
+describe("replaceFile", () => {
+  it("writes a new file with the given mode in place of a symlink", () => {
+    const directory = mkdtempSync(join(scratch, "replace-"));
+    const targetPath = join(directory, "target");
+    const filePath = join(directory, "file");
+    writeFileSync(targetPath, "untouched\n");
+    symlinkSync(targetPath, filePath);
+    replaceFile(filePath, "replaced\n", 0o600);
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+    assert.equal(readFileSync(filePath, "utf8"), "replaced\n");
+    assert.equal(spawnSync("/usr/bin/stat", ["-f", "%Lp", filePath], { encoding: "utf8" }).stdout.trim(), "600");
+  });
+
+  it("refuses a symlink planted at its temporary path instead of writing through it", () => {
+    const directory = mkdtempSync(join(scratch, "replace-"));
+    const targetPath = join(directory, "target");
+    const filePath = join(directory, "file");
+    writeFileSync(targetPath, "untouched\n");
+    const plantedBytes = Buffer.from("planted");
+    mock.method(crypto, "randomBytes", () => plantedBytes);
+    syncBuiltinESMExports();
+    try {
+      symlinkSync(targetPath, `${filePath}.${process.pid}-${plantedBytes.toString("hex")}`);
+      assert.throws(() => replaceFile(filePath, "replaced\n", 0o600), { code: "EEXIST" });
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.equal(readFileSync(targetPath, "utf8"), "untouched\n");
+    assert.equal(existsSync(filePath), false);
+  });
+
+  it("lets concurrent writers of one path all succeed, leaving one whole file", async () => {
+    // Every bridge writes the shared state directory's watch script when it
+    // starts, so two Claude sessions starting together replace it at once.
+    const directory = mkdtempSync(join(scratch, "replace-concurrent-"));
+    const filePath = join(directory, "watch.command");
+    const writerSource = `
+      import { replaceFile } from ${JSON.stringify(new URL("../src/tmux.mjs", import.meta.url).href)};
+      for (let attempt = 0; attempt < 500; attempt++) {
+        replaceFile(${JSON.stringify(filePath)}, "written by " + process.argv[1] + "\\n", 0o700);
+      }`;
+    const writerExitCodes = await Promise.all(
+      ["first", "second"].map(
+        (writerName) =>
+          new Promise((resolve) => {
+            const writer = spawn(process.execPath, ["--input-type=module", "-e", writerSource, writerName], {
+              stdio: "ignore",
+            });
+            writer.on("close", resolve);
+          }),
+      ),
+    );
+    assert.deepEqual(writerExitCodes, [0, 0]);
+    assert.match(readFileSync(filePath, "utf8"), /^written by (first|second)\n$/);
+    assert.deepEqual(readdirSync(directory), ["watch.command"]);
   });
 });

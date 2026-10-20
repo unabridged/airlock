@@ -1,16 +1,14 @@
-// Airlock — bridge configuration: load and validate ~/.config/airlock/config.json.
+// Airlock — bridge configuration: load and validate the config file the launch
+// options name (see {parseLaunchOptions}).
 //
 // The config is the authority for which destinations exist. A missing or
 // invalid config is a hard startup error naming that path — the bridge never
 // falls back to config.example.json or any built-in inventory.
 
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
 import { characterViolations } from "./command-contract.mjs";
 import { expandTilde, explicitHostAliases } from "./ssh-config.mjs";
-
-export const CONFIG_PATH = join(homedir(), ".config", "airlock", "config.json");
 
 const DRIVERS = ["shell", "rails_irb"];
 // How a target is reached: `ssh` (an explicit Host alias) or `script` (a
@@ -31,7 +29,10 @@ const DEFAULTS = {
   output_max_bytes: 65536,
 };
 
-export function loadConfig(configPath = CONFIG_PATH) {
+export function loadConfig(configPath) {
+  if (typeof configPath !== "string" || configPath === "") {
+    throw new TypeError("loadConfig requires the config file's path");
+  }
   let rawContent;
   try {
     rawContent = readFileSync(configPath, "utf8");

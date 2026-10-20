@@ -80,14 +80,28 @@ function humanizeBadge(badge) {
     .join(" ");
 }
 
-// The approval page: a header row (badge, requesting Claude Code session name
-// or the action question) above the colorized command, above a footer the
+// The pill naming a non-production instance, ahead of the target badge so a
+// development panel is never mistaken for the production gate.
+function instanceLabelPill(instanceLabel) {
+  if (!instanceLabel) return "";
+  return `<span class="badge dev">${escapeHtml(instanceLabel)}</span>`;
+}
+
+// The approval page: a header row (the instance pill of a non-production
+// instance, the target badge, and the requesting Claude Code session name or
+// the action question) above the colorized command, above a footer the
 // page owns — a note slot that the helper's native text field overlays
 // (WKWebView inputs cannot take dictation or paste in a non-activating
 // panel), a Deny button carrying the auto-deny countdown, and a split
 // Approve button whose 👀 segment also opens the terminal on the session.
 // All decisions post through {window.webkit.messageHandlers.decision}.
-export async function buildApprovalHtml({ command, badge, headerText, timeoutSeconds }) {
+export async function buildApprovalHtml({
+  command,
+  badge,
+  instanceLabel = null,
+  headerText,
+  timeoutSeconds,
+}) {
   const lines = (await highlightRuby(command)).split("\n");
   const rows = lines
     .map(
@@ -135,6 +149,8 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
      human reads a word. */
   .badge.prod { background: #5d3a42; color: #ff96a0; }
   .badge.staging { background: #5b5138; color: #ffd57a; }
+  /* A development instance's pill: purple, a tint no target badge uses. */
+  .badge.dev { background: #4b3b6b; color: #cfa8ff; }
   .title { color: #d6d9e9; font-size: 18px; font-weight: 510; }
   /* The code block is a positioning context for the more-lines badge. */
   .code { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
@@ -216,7 +232,7 @@ export async function buildApprovalHtml({ command, badge, headerText, timeoutSec
   .glyph { flex: none; }
   button.eyes .glyph { font-size: 17px; line-height: 1; text-shadow: none; }
 </style></head><body>
-  <div class="head">
+  <div class="head">${instanceLabelPill(instanceLabel)}
     <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
     <span class="title">${escapeHtml(headerText)}</span>
   </div>

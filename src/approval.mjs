@@ -14,25 +14,18 @@ import { accessSync, constants, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildApprovalHtml } from "./colorize.mjs";
 
-const DEFAULT_HELPER_PATH = fileURLToPath(
-  new URL("../bin/airlock-approve", import.meta.url),
-);
 const HELPER_SOURCE_PATH = fileURLToPath(
   new URL("../airlock-approve.swift", import.meta.url),
 );
 const HELPER_BUILD_COMMAND = "swiftc -O -o bin/airlock-approve airlock-approve.swift";
 
-// Injectable so tests substitute a fake helper and never display real panels.
-export function approvalHelperPath() {
-  return process.env.AIRLOCK_APPROVE_HELPER || DEFAULT_HELPER_PATH;
-}
-
 // Setup diagnostic (a warning, never fatal): a missing or non-executable
 // helper otherwise surfaces only as "Not approved (helper-unavailable)" on
 // the first gated call, mid-workflow, and nothing rebuilds a helper older
 // than its source, so a pull that changes the overlay leaves the old panel
-// rendering the new approval page.
-export function approvalHelperProblem({ helperPath = approvalHelperPath(), sourcePath = HELPER_SOURCE_PATH } = {}) {
+// rendering the new approval page. A packaged install ships no source, so
+// only a checkout can report a stale helper.
+export function approvalHelperProblem({ helperPath, sourcePath = HELPER_SOURCE_PATH }) {
   try {
     accessSync(helperPath, constants.X_OK);
   } catch {
@@ -70,18 +63,11 @@ process.on("exit", () => {
 });
 
 // Resolves to { approved, decision, message } — it never rejects; every
-// failure mode is a non-approval with a decision label.
-export function requestApproval({
-  command,
-  badge,
-  actionDescription,
-  claudeSessionName,
-  timeoutSeconds,
-  watchCommandPath,
-}) {
-  const queuedRequest = overlayQueue.then(() =>
-    presentOverlay({ command, badge, actionDescription, claudeSessionName, timeoutSeconds, watchCommandPath }),
-  );
+// failure mode is a non-approval with a decision label. `helperPath` is the
+// overlay executable the launch options chose; `instanceLabel` (such as
+// "DEV") marks the panel of a non-production instance.
+export function requestApproval(request) {
+  const queuedRequest = overlayQueue.then(() => presentOverlay(request));
   // The queue must survive any outcome; presentOverlay never rejects anyway.
   overlayQueue = queuedRequest.then(
     () => undefined,
@@ -97,16 +83,19 @@ async function presentOverlay({
   claudeSessionName,
   timeoutSeconds,
   watchCommandPath,
+  helperPath,
+  instanceLabel = null,
 }) {
   const html = await buildApprovalHtml({
     command,
     badge,
+    instanceLabel,
     // The header carries the requesting Claude Code session's name when the
     // server learned it, falling back to the action question.
     headerText: claudeSessionName || actionDescription,
     timeoutSeconds,
   });
-  const title = claudeSessionName ? `Airlock — ${claudeSessionName}` : "Airlock — approval required";
+  const title = `${overlayTitlePrefix(instanceLabel)} — ${claudeSessionName || "approval required"}`;
 
   return new Promise((resolve) => {
     let settled = false;
@@ -119,7 +108,7 @@ async function presentOverlay({
 
     let helper;
     try {
-      helper = spawn(approvalHelperPath(), [], { stdio: ["pipe", "pipe", "ignore"] });
+      helper = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
     } catch (err) {
       settle(notApproved("helper-unavailable", `approval helper could not be spawned: ${err.message}`));
       return;
@@ -182,6 +171,10 @@ async function presentOverlay({
     helper.stdin.write(JSON.stringify({ html, timeoutSeconds, title, watchCommandPath }));
     helper.stdin.end();
   });
+}
+
+function overlayTitlePrefix(instanceLabel) {
+  return instanceLabel ? `Airlock ${instanceLabel}` : "Airlock";
 }
 
 function notApproved(decision, detail) {

@@ -1,7 +1,7 @@
 // Airlock — smoke tests (node --test test/smoke.test.mjs). Zero-dependency:
 // node:test + node:assert only. No test ever displays a real approval panel
-// (AIRLOCK_APPROVE_HELPER substitutes fake helpers) and none opens a real
-// SSH connection.
+// (fake helpers stand in, passed as a helper path or a development server's
+// --approval-helper) and none opens a real SSH connection.
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -11,6 +11,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   utimesSync,
   writeFileSync,
@@ -80,17 +81,6 @@ function writeBridgeConfig(overrides = {}) {
   return configPath;
 }
 
-async function withApprovalHelper(helperPath, work) {
-  const previous = process.env.AIRLOCK_APPROVE_HELPER;
-  process.env.AIRLOCK_APPROVE_HELPER = helperPath;
-  try {
-    return await work();
-  } finally {
-    if (previous === undefined) delete process.env.AIRLOCK_APPROVE_HELPER;
-    else process.env.AIRLOCK_APPROVE_HELPER = previous;
-  }
-}
-
 // ---- approval gate --------------------------------------------------------
 
 describe("requestApproval", () => {
@@ -107,7 +97,7 @@ describe("requestApproval", () => {
       "approve",
       `cat > /dev/null; printf '{"decision":"approve","message":"careful"}'`,
     );
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, true);
     assert.equal(approval.decision, "approve");
     assert.equal(approval.message, "careful");
@@ -118,7 +108,7 @@ describe("requestApproval", () => {
       "deny",
       `cat > /dev/null; printf '{"decision":"deny","message":"use a count first"}'`,
     );
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "deny");
     assert.equal(approval.message, "use a count first");
@@ -126,21 +116,21 @@ describe("requestApproval", () => {
 
   it("treats a literal null stdout (valid JSON, exit 0) as unparseable, not a crash", async () => {
     const helper = writeFakeHelper("null-output", `cat > /dev/null; printf 'null'`);
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "helper-crash");
   });
 
   it("treats garbage stdout as a non-approval", async () => {
     const helper = writeFakeHelper("garbage", `cat > /dev/null; printf 'not json at all'`);
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "helper-crash");
   });
 
   it("treats a helper-reported timeout as a clean non-approval", async () => {
     const helper = writeFakeHelper("timeout", `cat > /dev/null; printf '{"decision":"timeout"}'`);
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "timeout");
   });
@@ -152,9 +142,11 @@ describe("requestApproval", () => {
     // exec replaces the shell so the backstop's SIGKILL reaps the sleep too
     // (an orphaned sleep would hold the stdout pipe open for its full 30s).
     const helper = writeFakeHelper("hang", `cat > /dev/null; exec sleep 30`);
-    const approval = await withApprovalHelper(helper, () =>
-      requestApproval({ ...approvalRequest, timeoutSeconds: -29.7 }),
-    );
+    const approval = await requestApproval({
+      ...approvalRequest,
+      helperPath: helper,
+      timeoutSeconds: -29.7,
+    });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "timeout");
   });
@@ -165,9 +157,11 @@ describe("requestApproval", () => {
       "payload-dump",
       `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
     );
-    await withApprovalHelper(helper, () =>
-      requestApproval({ ...approvalRequest, command: "User.where(id: 42).count" }),
-    );
+    await requestApproval({
+      ...approvalRequest,
+      helperPath: helper,
+      command: "User.where(id: 42).count",
+    });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.deepEqual(Object.keys(payload).sort(), ["html", "timeoutSeconds", "title"]);
@@ -185,9 +179,11 @@ describe("requestApproval", () => {
       "payload-dump-watch",
       `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
     );
-    await withApprovalHelper(helper, () =>
-      requestApproval({ ...approvalRequest, watchCommandPath: "/fake/state/watch.command" }),
-    );
+    await requestApproval({
+      ...approvalRequest,
+      helperPath: helper,
+      watchCommandPath: "/fake/state/watch.command",
+    });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.equal(payload.watchCommandPath, "/fake/state/watch.command");
@@ -202,26 +198,46 @@ describe("requestApproval", () => {
       "payload-dump-named",
       `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
     );
-    await withApprovalHelper(helper, () =>
-      requestApproval({ ...approvalRequest, claudeSessionName: "Fix PROJ-123" }),
-    );
+    await requestApproval({
+      ...approvalRequest,
+      helperPath: helper,
+      claudeSessionName: "Fix PROJ-123",
+    });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.equal(payload.title, "Airlock — Fix PROJ-123");
     assert.match(payload.html, /Fix PROJ-123/);
   });
 
+  it("marks a labeled instance's overlay title and header", async () => {
+    const payloadPath = join(scratch, "helper-stdin-labeled");
+    const helper = writeFakeHelper(
+      "payload-dump-labeled",
+      `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+    );
+    await requestApproval({
+      ...approvalRequest,
+      helperPath: helper,
+      claudeSessionName: "Fix PROJ-123",
+      instanceLabel: "DEV",
+    });
+    const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+    assert.equal(payload.title, "Airlock DEV — Fix PROJ-123");
+    assert.match(payload.html, /<span class="badge dev">DEV<\/span>\s*<span class="badge">Test<\/span>/);
+  });
+
   it("treats a non-zero exit as a non-approval", async () => {
     const helper = writeFakeHelper("crash", `cat > /dev/null; exit 3`);
-    const approval = await withApprovalHelper(helper, () => requestApproval(approvalRequest));
+    const approval = await requestApproval({ ...approvalRequest, helperPath: helper });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "helper-crash");
   });
 
   it("treats a missing helper binary as a non-approval", async () => {
-    const approval = await withApprovalHelper(join(scratch, "does-not-exist"), () =>
-      requestApproval(approvalRequest),
-    );
+    const approval = await requestApproval({
+      ...approvalRequest,
+      helperPath: join(scratch, "does-not-exist"),
+    });
     assert.equal(approval.approved, false);
     assert.equal(approval.decision, "helper-unavailable");
   });
@@ -233,9 +249,8 @@ describe("requestApproval", () => {
       "serialize",
       `cat > /dev/null; echo "start $$" >> ${markerPath}; sleep 0.3; echo "end $$" >> ${markerPath}; printf '{"decision":"deny"}'`,
     );
-    await withApprovalHelper(helper, () =>
-      Promise.all([requestApproval(approvalRequest), requestApproval(approvalRequest)]),
-    );
+    const serializedRequest = { ...approvalRequest, helperPath: helper };
+    await Promise.all([requestApproval(serializedRequest), requestApproval(serializedRequest)]);
     const { readFileSync } = await import("node:fs");
     const events = readFileSync(markerPath, "utf8").trim().split("\n");
     assert.equal(events.length, 4);
@@ -468,6 +483,23 @@ describe("buildApprovalHtml", () => {
     assert.match(html, /\.ln \.c \{ white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;/);
     assert.match(html, /<span id="more-lines" hidden><\/span>/);
   });
+
+  it("renders no instance pill for an unlabeled instance", async () => {
+    const html = await buildApprovalHtml({ command, badge: "test-shell", headerText: "Send?", timeoutSeconds: 30 });
+    assert.doesNotMatch(html, /class="badge dev"/);
+  });
+
+  it("renders the instance label as an escaped pill ahead of the target badge", async () => {
+    const html = await buildApprovalHtml({
+      command,
+      badge: "test-shell",
+      instanceLabel: "<DEV>",
+      headerText: "Send?",
+      timeoutSeconds: 30,
+    });
+    assert.match(html, /<span class="badge dev">&lt;DEV&gt;<\/span>\s*<span class="badge">Test Shell<\/span>/);
+    assert.match(html, /\.badge\.dev \{ background: #4b3b6b; color: #cfa8ff; \}/);
+  });
 });
 
 // ---- ssh config parsing ---------------------------------------------------
@@ -565,29 +597,51 @@ describe("loadConfig", () => {
 // ---- server end-to-end (stdio JSON-RPC, no tmux, no ssh) ------------------
 
 describe("server.mjs over stdio", () => {
-  function startServer({ helperScript, stateDirectory, env = {} }) {
-    const helper = writeFakeHelper(`e2e-helper-${Math.random().toString(36).slice(2)}`, helperScript);
-    // A private state dir per server: the session lock and tmux socket must
-    // never touch a real bridge's ~/.local/state/airlock. Lock-contention
-    // tests pass a shared one in.
-    stateDirectory ??= mkdtempSync(join(scratch, "state-"));
-    const spawnEnvironment = {
-      ...process.env,
-      AIRLOCK_CONFIG: writeBridgeConfig(),
-      AIRLOCK_APPROVE_HELPER: helper,
-      AIRLOCK_STATE_DIR: stateDirectory,
-      ...env,
-    };
+  const RETIRED_ENVIRONMENT_FLAGS = {
+    AIRLOCK_CONFIG: "--config",
+    AIRLOCK_STATE_DIR: "--state-dir",
+    AIRLOCK_APPROVE_HELPER: "--approval-helper",
+  };
+
+  function spawnServer(argv, env = {}) {
+    const spawnEnvironment = { ...process.env, ...env };
     // The test process itself may be running inside a Claude session; its
     // identity must never leak into the server under test (the overlay title
-    // tests would see the REAL session's on-disk title otherwise).
-    for (const key of ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]) {
+    // tests would see the REAL session's on-disk title otherwise). Nor may a
+    // variable the server refuses, left in a developer's own shell.
+    const inheritedKeys = [
+      "CLAUDE_CONFIG_DIR",
+      "CLAUDE_CODE_HOST_SESSION_ID",
+      "CLAUDE_CODE_SESSION_ID",
+      ...Object.keys(RETIRED_ENVIRONMENT_FLAGS),
+    ];
+    for (const key of inheritedKeys) {
       if (!(key in env)) delete spawnEnvironment[key];
     }
-    const child = spawn(process.execPath, [SERVER_PATH], {
+    return spawn(process.execPath, [SERVER_PATH, ...argv], {
       env: spawnEnvironment,
       stdio: ["pipe", "pipe", "pipe"],
     });
+  }
+
+  // A development server with a fake helper. A private state dir per server:
+  // the session lock and tmux socket must never touch a real bridge's
+  // ~/.local/state/airlock. Lock-contention tests pass a shared one in. A
+  // stale helper is backdated to the epoch, older than its Swift source.
+  function startServer({
+    helperScript,
+    stateDirectory,
+    configPath = writeBridgeConfig(),
+    staleHelper = false,
+    env = {},
+  }) {
+    const helper = writeFakeHelper(`e2e-helper-${Math.random().toString(36).slice(2)}`, helperScript);
+    if (staleHelper) utimesSync(helper, 0, 0);
+    stateDirectory ??= mkdtempSync(join(scratch, "state-"));
+    const child = spawnServer(
+      ["--dev", "--config", configPath, "--state-dir", stateDirectory, "--approval-helper", helper],
+      env,
+    );
     let buffer = "";
     const pending = new Map();
     child.stdout.on("data", (chunk) => {
@@ -615,15 +669,88 @@ describe("server.mjs over stdio", () => {
     return { child, call, stateDirectory };
   }
 
+  // Runs a server that must refuse to start: it exits without answering the
+  // initialize request written to it (a server that did start would answer,
+  // then exit on the closed stdin).
+  async function runRefusedServer(argv, env = {}) {
+    const child = spawnServer(argv, env);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.stdin.on("error", () => {});
+    child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`);
+    const exitCode = await new Promise((resolve) => child.on("close", resolve));
+    return { exitCode, stdout, stderr };
+  }
+
+  function developmentArgv() {
+    return [
+      "--dev",
+      "--config",
+      writeBridgeConfig(),
+      "--state-dir",
+      mkdtempSync(join(scratch, "state-")),
+      "--approval-helper",
+      writeFakeHelper("refused-helper", `cat > /dev/null; printf '{"decision":"deny"}'`),
+    ];
+  }
+
+  it("refuses to run as production from a checkout the user owns", async () => {
+    const { exitCode, stdout, stderr } = await runRefusedServer([]);
+    assert.equal(exitCode, 1);
+    assert.equal(stdout, "");
+    assert.match(
+      stderr,
+      /^\[airlock\] refusing to start: the Airlock installation at \/.+ fails its trust check\.\n/,
+    );
+    assert.match(stderr, new RegExp(`: owned by uid ${process.getuid()}, not root\\n`));
+    assert.match(
+      stderr,
+      /\nInstall the package \(see README\), or run a development instance with --dev --config <path> --state-dir <path>\.\n$/,
+    );
+  });
+
+  for (const [variable, flag] of Object.entries(RETIRED_ENVIRONMENT_FLAGS)) {
+    it(`refuses to start with ${variable} set, naming ${flag}`, async () => {
+      const { exitCode, stdout, stderr } = await runRefusedServer(developmentArgv(), {
+        [variable]: join(scratch, "ignored"),
+      });
+      assert.equal(exitCode, 1);
+      assert.equal(stdout, "");
+      assert.match(
+        stderr,
+        new RegExp(`^\\[airlock\\] startup failed: ${variable} is no longer supported; pass ${flag} instead`),
+      );
+    });
+  }
+
+  it("refuses a development instance without a state directory", async () => {
+    const { exitCode, stdout, stderr } = await runRefusedServer(["--dev", "--config", writeBridgeConfig()]);
+    assert.equal(exitCode, 1);
+    assert.equal(stdout, "");
+    assert.match(stderr, /^\[airlock\] startup failed: --dev requires --state-dir <path>\nusage: airlock-server /);
+  });
+
   it("initializes, lists tools, and cleanly rejects prototype-key targets", async () => {
+    const configPath = writeBridgeConfig();
     const { child, call } = startServer({
       helperScript: `cat > /dev/null; printf '{"decision":"deny"}'`,
+      configPath,
     });
     try {
       const initialized = await call("initialize", {
         protocolVersion: "2025-06-18",
         clientInfo: { name: "test-client" },
       });
+      const packageManifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+      assert.deepEqual(initialized.result.serverInfo, { name: "airlock", version: packageManifest.version });
+      // A development instance says so before anything else the model reads.
+      assert.ok(
+        initialized.result.instructions.startsWith(
+          `This is a development instance of Airlock (--dev), whose targets come from ${configPath}.\n\n`,
+        ),
+      );
       assert.match(initialized.result.instructions, /Test instructions\./);
       assert.match(initialized.result.instructions, /test-shell/);
       // Standing guidance: relay open_terminal's attach block so the human
@@ -706,7 +833,7 @@ describe("server.mjs over stdio", () => {
     }
   });
 
-  it("passes clientInfo through initialize into the overlay title", async () => {
+  it("passes clientInfo through initialize into the DEV-marked overlay title", async () => {
     const payloadPath = join(scratch, `e2e-payload-${Math.random().toString(36).slice(2)}`);
     const { child, call } = startServer({
       helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
@@ -719,7 +846,8 @@ describe("server.mjs over stdio", () => {
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
       const { readFileSync } = await import("node:fs");
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock — Debug PROJ-99");
+      assert.equal(payload.title, "Airlock DEV — Debug PROJ-99");
+      assert.match(payload.html, /<span class="badge dev">DEV<\/span>/);
       assert.match(payload.html, /Debug PROJ-99/);
       // The resolved display_command (colorized: tokens may be span-wrapped).
       assert.match(payload.html, /ssh/);
@@ -753,7 +881,7 @@ describe("server.mjs over stdio", () => {
       });
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock — Investigate PROJ-500");
+      assert.equal(payload.title, "Airlock DEV — Investigate PROJ-500");
       assert.match(payload.html, /Investigate PROJ-500/);
       assert.doesNotMatch(payload.html, /claude-ai/);
     } finally {
@@ -797,16 +925,15 @@ describe("server.mjs over stdio", () => {
   });
 
   it("warns about a stale approval helper when the open is denied", async () => {
-    const staleHelper = writeFakeHelper("e2e-stale-helper", `cat > /dev/null; printf '{"decision":"deny"}'`);
-    utimesSync(staleHelper, 0, 0);
-    const stale = startServer({ helperScript: "", env: { AIRLOCK_APPROVE_HELPER: staleHelper } });
-    const fresh = startServer({ helperScript: `cat > /dev/null; printf '{"decision":"deny"}'` });
+    const denyHelper = `cat > /dev/null; printf '{"decision":"deny"}'`;
+    const stale = startServer({ helperScript: denyHelper, staleHelper: true });
+    const fresh = startServer({ helperScript: denyHelper });
     try {
       const openArguments = { name: "open_terminal", arguments: { target: "test-shell" } };
       await stale.call("initialize", { protocolVersion: "2025-06-18" });
       const staleResult = await stale.call("tools/call", openArguments);
       assert.match(staleResult.result.content[0].text, /Not approved \(deny\)/);
-      assert.match(staleResult.result.content[0].text, /\n\nSetup warning: approval helper at .*e2e-stale-helper is older than/);
+      assert.match(staleResult.result.content[0].text, /\n\nSetup warning: approval helper at .*e2e-helper-\w+ is older than/);
       await fresh.call("initialize", { protocolVersion: "2025-06-18" });
       const freshResult = await fresh.call("tools/call", openArguments);
       assert.doesNotMatch(freshResult.result.content[0].text, /Setup warning/);
@@ -833,14 +960,10 @@ describe("server.mjs over stdio", () => {
         },
       },
     });
-    const staleHelper = writeFakeHelper(
-      "e2e-stale-approving-helper",
-      `cat > /dev/null; printf '{"decision":"approve"}'`,
-    );
-    utimesSync(staleHelper, 0, 0);
     const { child, call, stateDirectory } = startServer({
-      helperScript: "",
-      env: { AIRLOCK_CONFIG: configPath, AIRLOCK_APPROVE_HELPER: staleHelper },
+      helperScript: `cat > /dev/null; printf '{"decision":"approve"}'`,
+      configPath,
+      staleHelper: true,
     });
     try {
       await call("initialize", { protocolVersion: "2025-06-18" });
@@ -848,7 +971,7 @@ describe("server.mjs over stdio", () => {
       assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
       assert.match(
         opened.result.content[0].text,
-        /\n\nSetup warning: approval helper at .*e2e-stale-approving-helper is older than/,
+        /\n\nSetup warning: approval helper at .*e2e-helper-\w+ is older than/,
       );
       await call("tools/call", { name: "close_terminal", arguments: {} });
     } finally {
@@ -996,7 +1119,12 @@ describe("server.mjs over stdio", () => {
       });
       assert.equal(refused.result.isError, true);
       assert.match(refused.result.content[0].text, /left by an earlier Airlock bridge/);
-      assert.match(refused.result.content[0].text, /bin\/airlock-attach/);
+      // A development instance's attach client watches its own state dir.
+      const attachCommandLine = `${join(realpathSync(REPO_ROOT), "bin", "airlock-attach")} --state-dir ${stateDirectory}`;
+      assert.ok(
+        refused.result.content[0].text.includes(`\`\`\`bash\n${attachCommandLine}\n\`\`\``),
+        refused.result.content[0].text,
+      );
       assert.ok(!existsSync(overlayMarker), "the approval overlay must not have popped");
     } finally {
       spawnSync(tmuxBinaryForTests(), ["-S", socketPath, "kill-server"]);
@@ -1025,13 +1153,17 @@ describe("server.mjs over stdio", () => {
     const { child, call, stateDirectory } = startServer({
       // Approves everything and logs one line per panel shown.
       helperScript: `echo shown >> ${overlayLog}; cat > /dev/null; printf '{"decision":"approve"}'`,
-      env: { AIRLOCK_CONFIG: configPath },
+      configPath,
     });
     const overlayCount = () => (existsSync(overlayLog) ? readFileSync(overlayLog, "utf8").split("\n").length - 1 : 0);
     try {
       await call("initialize", { protocolVersion: "2025-06-18" });
       const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
       assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+      assert.ok(
+        opened.result.content[0].text.includes(`/bin/airlock-attach --state-dir ${stateDirectory}\n`),
+        opened.result.content[0].text,
+      );
       assert.equal(overlayCount(), 1);
 
       const wideCommand = `echo ${"a".repeat(115)}`;

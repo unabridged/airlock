@@ -7,17 +7,68 @@
 # drives. When the session closes, the client returns to idling and
 # auto-attaches to the next one. Ctrl-C quits the client itself.
 #
+# The production bridge's attach block runs it bare; a development
+# instance's names that instance's own state directory with --state-dir.
+#
 # The socket is the bridge's private one — never the user's default tmux
-# server. Attaching never starts a server, so no -f config is needed here.
-SOCKET_PATH="$HOME/.local/state/airlock/tmux.sock"
+# server.
+
+usage() {
+  echo "usage: airlock-attach [--state-dir DIR]" >&2
+  exit 2
+}
+
+STATE_DIRECTORY="$HOME/.local/state/airlock"
+while (( $# > 0 )); do
+  case "$1" in
+    --state-dir)
+      (( $# >= 2 )) && [[ -n "$2" ]] || usage
+      STATE_DIRECTORY="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+SOCKET_PATH="$STATE_DIRECTORY/tmux.sock"
 SESSION_NAME="airlock"
-FINAL_SCREEN_PATH="$HOME/.local/state/airlock/final-screen"
+FINAL_SCREEN_PATH="$STATE_DIRECTORY/final-screen"
+
+# The installed package bundles the tmux its bridge runs; a checkout uses the
+# Homebrew tmux its development bridge picks. The bundled tmux's ncurses looks
+# the terminal up in $TERMINFO before ~/.terminfo, $TERMINFO_DIRS, and its own
+# Homebrew prefix, all writable by the user, so the client switches to
+# xterm-256color when the system database has no entry for TERM.
+INSTALL_ROOT="${0:A:h:h}"
+if [[ -x "$INSTALL_ROOT/runtime/bin/tmux" ]]; then
+  TMUX_EXECUTABLE="$INSTALL_ROOT/runtime/bin/tmux"
+  export TERMINFO=/usr/share/terminfo
+  if [[ $TERM == */* || ! -f $TERMINFO/$(printf %02x "'${TERM[1]}")/$TERM ]]; then
+    export TERM=xterm-256color
+  fi
+elif [[ -e /opt/homebrew/bin/tmux ]]; then
+  TMUX_EXECUTABLE=/opt/homebrew/bin/tmux
+elif [[ -e /usr/local/bin/tmux ]]; then
+  TMUX_EXECUTABLE=/usr/local/bin/tmux
+else
+  TMUX_EXECUTABLE=tmux
+fi
+
+# Runs tmux on the bridge's socket with an empty config file. attach-session
+# starts a server when none is running (a session that ends after the
+# has-session check), and without -f that server would load the user's own
+# ~/.tmux.conf and keep its options and hooks for the bridge's next session.
+bridge_tmux() {
+  "$TMUX_EXECUTABLE" -S "$SOCKET_PATH" -f /dev/null "$@"
+}
 
 announced_waiting=false
 while true; do
-  if tmux -S "$SOCKET_PATH" has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if bridge_tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     echo "airlock: session opened — attaching."
-    tmux -S "$SOCKET_PATH" attach-session -t "$SESSION_NAME"
+    bridge_tmux attach-session -t "$SESSION_NAME"
     # The tmux client clears the screen unconditionally when it exits. The
     # bridge saves the pane's final screen just before closing the session
     # (and deletes it when a new one starts), so a present file means this
@@ -29,7 +80,7 @@ while true; do
     fi
     # A deliberate detach while the session lives means "stop watching this
     # one": drain until it ends so we only auto-attach the NEXT session.
-    while tmux -S "$SOCKET_PATH" has-session -t "$SESSION_NAME" 2>/dev/null; do
+    while bridge_tmux has-session -t "$SESSION_NAME" 2>/dev/null; do
       sleep 2
     done
     announced_waiting=false
