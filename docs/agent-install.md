@@ -2,7 +2,7 @@
 
 These instructions are for the agent. The person pasted a request to install
 Airlock and expects you to guide them through it. Everything you need is
-here; the README has the background if they ask for it.
+here; the [manual install](install.md) has the background if they ask for it.
 
 ## Ground rules
 
@@ -17,8 +17,7 @@ here; the README has the background if they ask for it.
 - Never run `ssh`, `scp`, `sftp`, or `tmux`, and never print the contents of
   the SSH config. List its host names with the command in step 3.
 - If a step fails in a way these instructions do not cover, stop, show the
-  output, and point the person to the README's
-  [Install](../README.md#install) section.
+  output, and point the person to the [manual install](install.md).
 
 ## 1. Check the machine
 
@@ -39,13 +38,8 @@ Airlock is installed already: say so and go to step 3.
 
 ## 2. Install the package
 
-Check whether the repository is public:
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://github.com/unabridged/airlock
-```
-
-**Public (`200`) with Homebrew installed:** tap the repository yourself:
+**With Homebrew** (`command -v brew` prints a path): tap the repository
+yourself, unless `brew tap` already lists `unabridged/airlock`:
 
 ```bash
 brew tap unabridged/airlock https://github.com/unabridged/airlock
@@ -57,13 +51,18 @@ Then hand the person the install, which asks for their password:
 brew install --cask unabridged/airlock/airlock
 ```
 
-**Private (`404`), or no Homebrew:** download the latest package with the
-GitHub CLI. If `gh` is missing or `gh auth status` fails, stop and ask the
-person to install it and run `gh auth login`. Download into a new, empty
-directory and print the package's path:
+**Without Homebrew:** find the latest release, whose tag ends the printed URL
+(such as `.../releases/tag/v1.0.0`):
 
 ```bash
-download_dir="$(mktemp -d)" && gh release download -R unabridged/airlock -p 'airlock-*.pkg' -D "$download_dir" && ls "$download_dir"/*.pkg
+curl -fsSL -o /dev/null -w '%{url_effective}\n' https://github.com/unabridged/airlock/releases/latest
+```
+
+Download its package into a new, empty directory, replacing `X.Y.Z` with the
+tag's version, and print the package's path:
+
+```bash
+download_dir="$(mktemp -d)" && curl -fL -o "$download_dir/airlock-X.Y.Z.pkg" https://github.com/unabridged/airlock/releases/download/vX.Y.Z/airlock-X.Y.Z.pkg && ls "$download_dir"/*.pkg
 ```
 
 Then hand the person the install command with that path:
@@ -72,12 +71,10 @@ Then hand the person the install command with that path:
 sudo installer -pkg /path/to/airlock-X.Y.Z.pkg -target /
 ```
 
-Any other status code: stop and show it.
-
 Afterwards, confirm `/usr/local/libexec/airlock/bin/airlock-server` exists.
 If it does not, the installer refused an unsafe `/usr/local` (a symlink, or a
-directory not owned by root): stop and point the person to the README's
-[Direct package](../README.md#direct-package) section.
+directory not owned by root): stop and point the person to the manual
+install's [Direct package](install.md#direct-package) section.
 
 ## 3. Choose the hosts
 
@@ -274,8 +271,8 @@ absolute path, and relative to its project:
 ```
 
 Tell the person in one sentence that these rules are policy: only Claude
-Code's sandbox actually cuts off the hosts, as the README's
-[Block the direct path](../README.md#block-the-direct-path) section explains.
+Code's sandbox actually cuts off the hosts, as the manual install's
+[Block the direct path](install.md#block-the-direct-path) section explains.
 
 ## 7. Finish
 
