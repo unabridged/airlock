@@ -152,17 +152,16 @@ git checkout vX.Y.Z
 ```
 
 ```bash
-bin/build-pkg --tag vX.Y.Z
+bin/build-pkg
 ```
 
 ```bash
-sudo installer -pkg dist/airlock-X.Y.Z.pkg -target /
+sudo installer -pkg dist/airlock-X.Y.Z-dev-<commit>.pkg -target /
 ```
 
-The build bundles only the Homebrew tmux files that
-[`packaging/runtime.lock`](packaging/runtime.lock) pins. If your Homebrew has
-other versions, the build names them. Pin yours in a local commit, build
-without `--tag`, and install the `airlock-X.Y.Z-dev-<commit>.pkg` it writes.
+The package bundles your Homebrew tmux. When its files differ from the ones
+[`packaging/runtime.lock`](packaging/runtime.lock) pins for the release, the
+build says so and goes on; only a release build (`--tag`) insists on them.
 
 ### Configure
 
@@ -504,11 +503,13 @@ version in `.tool-versions` (it refuses any other version, and any node
 without the OpenJS Foundation's Developer ID signature, such as Homebrew's),
 network access for `npm ci`, which checks every dependency against
 `package-lock.json`, and Homebrew tmux (`brew install tmux`). It bundles tmux
-with its libraries relinked into the package and their license files, but only
-the exact files [`packaging/runtime.lock`](packaging/runtime.lock) pins by
-formula, version, path, and SHA-256: another version, a changed file, or a
-file the lock does not list fails the build. After a Homebrew upgrade, the failure prints the
-entries that would pin what the machine has. Check the new versions
+with its libraries relinked into the package and their license files, and
+compares them with the exact files
+[`packaging/runtime.lock`](packaging/runtime.lock) pins by formula, version,
+path, and SHA-256. A release build (`--tag`) fails on another version, a
+changed file, or a file the lock does not list; any other build reports the
+difference and goes on. Either way the report prints the entries that would
+pin what the machine has. After a Homebrew upgrade, check the new versions
 (`brew info tmux`), replace the entries in the lock with those lines, and
 commit the change on its own so it is reviewed as a dependency upgrade.
 
@@ -517,8 +518,9 @@ repository, build a release there, expand the result with `pkgutil`, and check
 its layout, ownership, permissions, bundled libraries, and launcher. They also
 check that the build refuses uncommitted changes, a build script that differs
 from the commit, a tag that HEAD is not on or that differs from
-`package.json`, and Homebrew files the lock does not pin.
-They never install the package:
+`package.json`, and a release with Homebrew files the lock does not pin, and
+that a development build of those files only warns. They never install the
+package:
 
 ```bash
 npm run test:package

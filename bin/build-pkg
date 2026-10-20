@@ -17,9 +17,10 @@
 # differs from HEAD and stages the repository's files from the commit's blobs.
 # With --tag, HEAD must be that tag and package.json must carry its version;
 # only such a build gets the release name airlock-X.Y.Z.pkg that
-# bin/bump-cask accepts, and any other is named after its commit. The tmux
-# binary, its libraries, and their license files must be the exact Homebrew
-# files packaging/runtime.lock pins by version and SHA-256.
+# bin/bump-cask accepts, and any other is named after its commit. A release
+# build also requires the tmux binary, its libraries, and their license files
+# to be the exact Homebrew files packaging/runtime.lock pins by version and
+# SHA-256; any other build reports a difference and goes on.
 #
 # It runs from any directory and writes nothing inside the repository except
 # the output directory (default: dist/).
@@ -340,16 +341,23 @@ record_runtime_file() {
   runtime_lock_lines+=("$keg_file $sha256")
 }
 
-# Fails unless the Homebrew files bundled from this machine are exactly the
-# ones runtime.lock pins, and prints the entries that would pin them.
+# Compares the Homebrew files bundled from this machine with the ones
+# runtime.lock pins, and prints the entries that would pin them on a
+# difference. A release build then fails; a development build goes on, since
+# its name already says it is not a release.
 verify_runtime_lock() {
   local pinned_entries bundled_entries
   pinned_entries=$(read_runtime_lock "$source_root/$RUNTIME_LOCK")
   bundled_entries=$(printf '%s\n' "${runtime_lock_lines[@]}" | LC_ALL=C sort -u)
   [[ $bundled_entries != "$pinned_entries" ]] || return 0
   {
-    printf 'build-pkg: the Homebrew files bundled from this machine do not match %s.\n' \
-      "$RUNTIME_LOCK"
+    if [[ -n $release_tag ]]; then
+      printf 'build-pkg: the Homebrew files bundled from this machine do not match %s.\n' \
+        "$RUNTIME_LOCK"
+    else
+      printf 'build-pkg: warning: the Homebrew files bundled from this machine do not match %s, which a release build (--tag) refuses.\n' \
+        "$RUNTIME_LOCK"
+    fi
     LC_ALL=C comm -23 <(print_lines "$bundled_entries") <(print_lines "$pinned_entries") |
       sed 's/^/    bundled, not pinned: /'
     LC_ALL=C comm -13 <(print_lines "$bundled_entries") <(print_lines "$pinned_entries") |
@@ -357,7 +365,7 @@ verify_runtime_lock() {
     printf 'After checking these versions, pin them by replacing the entries in %s with:\n%s\n' \
       "$RUNTIME_LOCK" "$bundled_entries"
   } >&2
-  exit 1
+  [[ -z $release_tag ]] || exit 1
 }
 
 # Prints the entries of a runtime.lock file, one normalized line each, sorted.

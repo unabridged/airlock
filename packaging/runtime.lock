@@ -1,8 +1,9 @@
 # The Homebrew files bin/build-pkg bundles as the package's tmux runtime and
 # its license texts, one per line: formula, version, path inside the keg, and
-# SHA-256. The build fails unless the files it bundles from the build
-# machine's Homebrew are exactly these. To move to another version, upgrade it
-# with Homebrew, run bin/build-pkg, check the versions it reports, and replace
+# SHA-256. A release build (--tag) fails unless the files it bundles from the
+# build machine's Homebrew are exactly these; any other build reports the
+# difference and goes on. To move to another version, upgrade it with
+# Homebrew, run bin/build-pkg, check the versions it reports, and replace
 # these entries with the ones it prints.
 libevent 2.1.12_1 LICENSE ff02effc9b331edcdac387d198691bfa3e575e7d244ad10cb826aa51ef085670
 libevent 2.1.12_1 lib/libevent_core-2.1.7.dylib 4cf8da116fdb8f2ba51d7117aa1cab30bc0c6a929142592f876f106091883f95
