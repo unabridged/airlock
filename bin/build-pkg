@@ -1,7 +1,7 @@
 #!/bin/bash
 # Airlock — builds the root-installing macOS package.
 #
-#   bin/build-pkg [--output DIR] [--sign "Developer ID Installer: ..."]
+#   bin/build-pkg [--tag vX.Y.Z] [--output DIR] [--sign "Developer ID Installer: ..."]
 #
 # Stages the install root (/usr/local/libexec/airlock) in a temporary
 # directory: the server source and its production dependencies, the compiled
@@ -12,6 +12,14 @@
 # by root, wrapped in a product archive limited to Apple silicon and to the
 # oldest macOS every bundled binary supports. The package never ships
 # config.json: the admin creates it with sudo, and upgrades leave it in place.
+#
+# The package holds exactly one commit: the build refuses a working tree that
+# differs from HEAD and stages the repository's files from the commit's blobs.
+# With --tag, HEAD must be that tag and package.json must carry its version;
+# only such a build gets the release name airlock-X.Y.Z.pkg that
+# bin/bump-cask accepts, and any other is named after its commit. The tmux
+# binary, its libraries, and their license files must be the exact Homebrew
+# files packaging/runtime.lock pins by version and SHA-256.
 #
 # It runs from any directory and writes nothing inside the repository except
 # the output directory (default: dist/).
@@ -24,17 +32,21 @@ INSTALL_LOCATION=usr/local/libexec/airlock
 # macOS: compute_minimum_macos takes the highest among all bundled binaries.
 HELPER_TARGET=arm64-apple-macos14
 BUNDLED_LIBRARY_PREFIX=@executable_path/../lib
+RUNTIME_LOCK=packaging/runtime.lock
 SYSTEM_TERMINFO=/usr/share/terminfo
 TMUX_CANDIDATES=(/opt/homebrew/bin/tmux /usr/local/bin/tmux)
 # The code requirement every nodejs.org macOS build meets: a Developer ID
 # signature of the OpenJS Foundation's team.
 NODE_SIGNING_REQUIREMENT='anchor apple generic and certificate leaf[subject.OU] = "HX7739G8FX"'
-REQUIRED_TOOLS=(pkgbuild productbuild otool install_name_tool codesign vtool
-  lipo shasum file realpath node npm)
+REQUIRED_TOOLS=(git cmp pkgbuild productbuild otool install_name_tool codesign
+  vtool lipo shasum file realpath comm node npm)
 
 output_directory="$REPOSITORY_ROOT/dist"
 signing_identity=""
+release_tag=""
+source_commit=""
 stage_directory=""
+source_root=""
 sanity_socket=""
 
 # Bundling state, kept in parallel arrays because /bin/bash 3.2 has no
@@ -42,6 +54,7 @@ sanity_socket=""
 bundled_library_names=()
 bundled_library_sources=()
 modified_machos=()
+runtime_lock_lines=()
 
 fail() {
   printf 'build-pkg: %s\n' "$*" >&2
@@ -49,7 +62,7 @@ fail() {
 }
 
 usage() {
-  printf 'usage: bin/build-pkg [--output DIR] [--sign "Developer ID Installer: ..."]\n'
+  printf 'usage: bin/build-pkg [--tag vX.Y.Z] [--output DIR] [--sign "Developer ID Installer: ..."]\n'
 }
 
 step() {
@@ -69,6 +82,11 @@ cleanup() {
 parse_arguments() {
   while (($#)); do
     case $1 in
+      --tag)
+        (($# >= 2)) || { usage >&2; exit 2; }
+        release_tag=$2
+        shift 2
+        ;;
       --output)
         (($# >= 2)) || { usage >&2; exit 2; }
         output_directory=$2
@@ -89,6 +107,9 @@ parse_arguments() {
         ;;
     esac
   done
+  if [[ -n $release_tag && ! $release_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "--tag takes a release tag of the form vX.Y.Z, not $release_tag."
+  fi
 }
 
 check_build_machine() {
@@ -100,6 +121,53 @@ check_build_machine() {
   done
   [[ -x /usr/bin/swiftc ]] ||
     fail "/usr/bin/swiftc not found: install the Xcode Command Line Tools (xcode-select --install)."
+}
+
+# Resolves the commit the package is built from and refuses a working tree
+# whose tracked or untracked files differ from it. Git's repository-local
+# environment variables are cleared first, so git reads this checkout.
+check_source_tree() {
+  # shellcheck disable=SC2046
+  unset $(git rev-parse --local-env-vars)
+  local top_level changes
+  top_level=$(git -C "$REPOSITORY_ROOT" rev-parse --show-toplevel 2>/dev/null) ||
+    fail "$REPOSITORY_ROOT is not a git checkout; the package builds only from a commit."
+  [[ $top_level -ef $REPOSITORY_ROOT ]] ||
+    fail "$REPOSITORY_ROOT is not the root of the git checkout $top_level."
+  source_commit=$(git -C "$REPOSITORY_ROOT" rev-parse --verify --quiet 'HEAD^{commit}') ||
+    fail "$REPOSITORY_ROOT has no commit to build."
+  changes=$(git -C "$REPOSITORY_ROOT" --no-optional-locks status --porcelain --untracked-files=all)
+  [[ -z $changes ]] ||
+    fail "the working tree differs from HEAD, and the package ships only committed files. Commit or remove these changes and build again:"$'\n'"$changes"
+}
+
+# Writes the commit's files into the stage byte for byte, so nothing else the
+# checkout holds reaches the package: not an ignored file, a change made during
+# the build, or a local attribute, filter, or replace ref that would rewrite a
+# file on its way out of git. The running script must be the committed one,
+# since git status does not report a file flagged skip-worktree.
+export_source_tree() {
+  step "Exporting commit $source_commit"
+  source_root="$stage_directory/source"
+  local tree_listing="$stage_directory/source-tree" entry metadata path mode object_id
+  git --no-replace-objects -C "$REPOSITORY_ROOT" ls-tree -r -z --full-tree "$source_commit" \
+    >"$tree_listing"
+  while IFS= read -r -d '' entry; do
+    metadata=${entry%%$'\t'*}
+    path=${entry#*$'\t'}
+    mode=${metadata%% *}
+    object_id=${metadata##* }
+    [[ $mode == 100644 || $mode == 100755 ]] ||
+      fail "$path in commit $source_commit is not a regular file (mode $mode)."
+    mkdir -p -- "$source_root/$(dirname -- "$path")"
+    git --no-replace-objects -C "$REPOSITORY_ROOT" cat-file blob "$object_id" \
+      >"$source_root/$path"
+    if [[ $mode == 100755 ]]; then
+      chmod 755 "$source_root/$path"
+    fi
+  done <"$tree_listing"
+  cmp -s -- "${BASH_SOURCE[0]}" "$source_root/bin/build-pkg" ||
+    fail "bin/build-pkg differs from commit $source_commit; build with the committed script."
 }
 
 # Resolves node the way the repository pins it (.tool-versions, read by mise
@@ -114,8 +182,8 @@ resolve_build_node() {
   node_source=$(realpath "$node_source")
   codesign --verify --strict -R="$NODE_SIGNING_REQUIREMENT" -- "$node_source" 2>/dev/null ||
     fail "$node_source is not a nodejs.org build signed by the OpenJS Foundation (team HX7739G8FX); build with the node that mise installs for .tool-versions."
-  pinned_version=$(awk '$1 == "nodejs" { print $2 }' "$REPOSITORY_ROOT/.tool-versions")
-  [[ -n $pinned_version ]] || fail "$REPOSITORY_ROOT/.tool-versions pins no nodejs version."
+  pinned_version=$(awk '$1 == "nodejs" { print $2 }' "$source_root/.tool-versions")
+  [[ -n $pinned_version ]] || fail ".tool-versions pins no nodejs version."
   node_version=$("$node_source" -p process.version)
   [[ $node_version == "v$pinned_version" ]] ||
     fail "$node_source is node $node_version, but .tool-versions pins $pinned_version."
@@ -132,9 +200,23 @@ read_package_version() {
   package_version=$(node -e '
     const { version } = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
     process.stdout.write(typeof version === "string" ? version : "");
-  ' "$REPOSITORY_ROOT/package.json")
+  ' "$source_root/package.json")
   [[ $package_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     fail "package.json needs a \"version\" of the form X.Y.Z (found \"$package_version\")."
+}
+
+# Requires a --tag build to run from that tag's commit, so the build script
+# and the staged files both come from the release, and package.json to carry
+# the tag's version.
+check_release_tag() {
+  [[ -n $release_tag ]] || return 0
+  local tag_commit
+  tag_commit=$(git -C "$REPOSITORY_ROOT" rev-parse --verify --quiet "refs/tags/$release_tag^{commit}") ||
+    fail "there is no tag $release_tag."
+  [[ $tag_commit == "$source_commit" ]] ||
+    fail "$release_tag is commit $tag_commit, but HEAD is $source_commit; check out the tag (git checkout $release_tag) and build again."
+  [[ ${release_tag#v} == "$package_version" ]] ||
+    fail "package.json's version is $package_version, but the tag is $release_tag."
 }
 
 prepare_directories() {
@@ -149,14 +231,13 @@ prepare_directories() {
 
 stage_source() {
   step "Staging the server source"
-  cp -RX -- "$REPOSITORY_ROOT/src" "$payload_root/src"
+  cp -RX -- "$source_root/src" "$payload_root/src"
   local file_name
   for file_name in package.json package-lock.json config.example.json; do
-    cp -X -- "$REPOSITORY_ROOT/$file_name" "$payload_root/$file_name"
+    cp -X -- "$source_root/$file_name" "$payload_root/$file_name"
   done
-  cp -X -- "$REPOSITORY_ROOT/bin/airlock-attach" "$REPOSITORY_ROOT/bin/airlock-server" \
+  cp -X -- "$source_root/bin/airlock-attach" "$source_root/bin/airlock-server" \
     "$payload_root/bin/"
-  /usr/bin/find "$payload_root" -name .DS_Store -type f -delete
 }
 
 stage_dependencies() {
@@ -168,12 +249,13 @@ stage_dependencies() {
 stage_helper() {
   step "Compiling the approval overlay helper ($HELPER_TARGET)"
   /usr/bin/swiftc -O -target "$HELPER_TARGET" -o "$payload_root/bin/airlock-approve" \
-    "$REPOSITORY_ROOT/airlock-approve.swift"
+    "$source_root/airlock-approve.swift"
 }
 
 stage_node() {
   step "Bundling node from $node_source"
   cp -pX -- "$node_source" "$payload_root/runtime/bin/node"
+  copy_license_files node "$(dirname -- "$(dirname -- "$node_source")")" copy_file
 }
 
 stage_tmux() {
@@ -187,9 +269,11 @@ stage_tmux() {
   [[ -n $tmux_link ]] || fail "tmux not found at ${TMUX_CANDIDATES[*]} (brew install tmux)."
   tmux_source=$(realpath "$tmux_link")
   step "Bundling tmux from $tmux_source"
-  cp -X -- "$tmux_source" "$payload_root/runtime/bin/tmux"
+  copy_homebrew_file "$tmux_source" "$payload_root/runtime/bin/tmux"
   chmod u+w "$payload_root/runtime/bin/tmux"
   bundle_library_dependencies "$payload_root/runtime/bin/tmux" "$tmux_source"
+  stage_homebrew_licenses
+  verify_runtime_lock
   sign_modified_machos
 }
 
@@ -214,7 +298,7 @@ bundle_library_dependencies() {
       library_name=$(basename -- "$reference")
       if ! library_was_bundled "$library_name" "$source_path"; then
         local library_path="$payload_root/runtime/lib/$library_name"
-        cp -X -- "$source_path" "$library_path"
+        copy_homebrew_file "$source_path" "$library_path"
         chmod u+w "$library_path"
         run_install_name_tool -id "$BUNDLED_LIBRARY_PREFIX/$library_name" "$library_path"
         record_modified_macho "$library_path"
@@ -231,6 +315,65 @@ bundle_library_dependencies() {
     delete_non_system_rpaths "$macho_path"
     queue_index=$((queue_index + 1))
   done
+}
+
+# Copies a file out of a Homebrew keg into the stage and records its
+# runtime.lock entry.
+copy_homebrew_file() {
+  cp -X -- "$1" "$2"
+  record_runtime_file "$1" "$2"
+}
+
+copy_file() {
+  cp -X -- "$1" "$2"
+}
+
+# Records the runtime.lock entry of a Homebrew file: its formula, version, path
+# inside the keg, and the SHA-256 of the copy just staged from it, before
+# anything changes the copy.
+record_runtime_file() {
+  local source_path=$1 copy_path=$2
+  [[ $source_path =~ /Cellar/([^/[:space:]]+)/([^/[:space:]]+)/([^[:space:]]+)$ ]] ||
+    fail "$source_path is not a Homebrew Cellar file, so $RUNTIME_LOCK cannot pin it."
+  local keg_file="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}" sha256
+  sha256=$(shasum -a 256 "$copy_path" | awk '{ print $1 }')
+  runtime_lock_lines+=("$keg_file $sha256")
+}
+
+# Fails unless the Homebrew files bundled from this machine are exactly the
+# ones runtime.lock pins, and prints the entries that would pin them.
+verify_runtime_lock() {
+  local pinned_entries bundled_entries
+  pinned_entries=$(read_runtime_lock "$source_root/$RUNTIME_LOCK")
+  bundled_entries=$(printf '%s\n' "${runtime_lock_lines[@]}" | LC_ALL=C sort -u)
+  [[ $bundled_entries != "$pinned_entries" ]] || return 0
+  {
+    printf 'build-pkg: the Homebrew files bundled from this machine do not match %s.\n' \
+      "$RUNTIME_LOCK"
+    LC_ALL=C comm -23 <(print_lines "$bundled_entries") <(print_lines "$pinned_entries") |
+      sed 's/^/    bundled, not pinned: /'
+    LC_ALL=C comm -13 <(print_lines "$bundled_entries") <(print_lines "$pinned_entries") |
+      sed 's/^/    pinned, not bundled: /'
+    printf 'After checking these versions, pin them by replacing the entries in %s with:\n%s\n' \
+      "$RUNTIME_LOCK" "$bundled_entries"
+  } >&2
+  exit 1
+}
+
+# Prints the entries of a runtime.lock file, one normalized line each, sorted.
+read_runtime_lock() {
+  [[ -f $1 ]] || fail "$RUNTIME_LOCK is missing from commit $source_commit."
+  local formula version keg_path sha256 extra
+  while read -r formula version keg_path sha256 extra || [[ -n $formula ]]; do
+    [[ -n $formula && $formula != \#* ]] || continue
+    [[ -z $extra && $sha256 =~ ^[0-9a-f]{64}$ ]] ||
+      fail "$RUNTIME_LOCK has a malformed entry (want: formula version path sha256): $formula $version $keg_path $sha256 $extra"
+    printf '%s %s %s %s\n' "$formula" "$version" "$keg_path" "$sha256"
+  done <"$1" | LC_ALL=C sort -u
+}
+
+print_lines() {
+  [[ -z $1 ]] || printf '%s\n' "$1"
 }
 
 is_system_reference() {
@@ -359,28 +502,26 @@ sign_modified_machos() {
   done
 }
 
-stage_licenses() {
-  step "Collecting licenses"
-  local node_prefix
-  node_prefix=$(dirname -- "$(dirname -- "$node_source")")
-  copy_license_files node "$node_prefix"
+# Copies the license files of every keg tmux and its libraries came from.
+stage_homebrew_licenses() {
   local source_path
   for source_path in "$tmux_source" ${bundled_library_sources[@]+"${bundled_library_sources[@]}"}; do
     if [[ $source_path =~ ^(.*/Cellar/([^/]+)/[^/]+)/ ]]; then
-      copy_license_files "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+      copy_license_files "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}" copy_homebrew_file
     fi
   done
 }
 
 # Copies LICENSE* and COPYING* from a component's install prefix into
-# runtime/licenses/<component>, and does nothing when it has none.
+# runtime/licenses/<component> with COPY_COMMAND, and does nothing when it has
+# none.
 copy_license_files() {
-  local component_name=$1 prefix_directory=$2 license_file
+  local component_name=$1 prefix_directory=$2 copy_command=$3 license_file
   local license_directory="$payload_root/runtime/licenses/$component_name"
   for license_file in "$prefix_directory"/LICENSE* "$prefix_directory"/COPYING*; do
     [[ -f $license_file ]] || continue
     mkdir -p -- "$license_directory"
-    cp -X -- "$license_file" "$license_directory/"
+    "$copy_command" "$license_file" "$license_directory/$(basename -- "$license_file")"
   done
 }
 
@@ -484,7 +625,7 @@ build_component_package() {
   step "Building the component package"
   local scripts_directory="$stage_directory/scripts"
   mkdir -p -- "$scripts_directory"
-  cp -X -- "$REPOSITORY_ROOT/packaging/scripts/preinstall" "$scripts_directory/preinstall"
+  cp -X -- "$source_root/packaging/scripts/preinstall" "$scripts_directory/preinstall"
   chmod 755 "$scripts_directory/preinstall"
   pkgbuild --root "$stage_directory/root" --identifier "$PACKAGE_IDENTIFIER" \
     --version "$package_version" --install-location / --ownership recommended \
@@ -521,9 +662,19 @@ write_distribution() {
   done
 }
 
+# Only a --tag build takes the release name that bin/bump-cask accepts; any
+# other is named after its commit.
+package_file_name() {
+  if [[ -n $release_tag ]]; then
+    printf 'airlock-%s.pkg' "$package_version"
+  else
+    printf 'airlock-%s-dev-%s.pkg' "$package_version" "${source_commit:0:12}"
+  fi
+}
+
 build_product_archive() {
   step "Building the product archive"
-  package_path="$output_directory/airlock-$package_version.pkg"
+  package_path="$output_directory/$(package_file_name)"
   rm -f -- "$package_path"
   local -a signing_arguments=()
   if [[ -n $signing_identity ]]; then
@@ -536,16 +687,18 @@ build_product_archive() {
 main() {
   parse_arguments "$@"
   check_build_machine
-  resolve_build_node
-  read_package_version
+  check_source_tree
   trap cleanup EXIT
   prepare_directories
+  export_source_tree
+  resolve_build_node
+  read_package_version
+  check_release_tag
   stage_source
+  stage_tmux
+  stage_node
   stage_dependencies
   stage_helper
-  stage_node
-  stage_tmux
-  stage_licenses
   verify_machos
   run_sanity_checks
   local minimum_macos
@@ -555,7 +708,7 @@ main() {
   build_component_package
   write_distribution "$minimum_macos"
   build_product_archive
-  printf '\nBuilt %s\nsha256 %s\n' "$package_path" \
+  printf '\nBuilt %s\ncommit %s\nsha256 %s\n' "$package_path" "$source_commit" \
     "$(shasum -a 256 "$package_path" | awk '{ print $1 }')"
 }
 

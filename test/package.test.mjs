@@ -3,10 +3,11 @@
 //
 // The launcher, attach client, and preinstall cases run in every suite
 // against temporary trees. The package cases run only with
-// AIRLOCK_PACKAGE_TEST=1 on macOS (npm run test:package): they build the .pkg
-// with bin/build-pkg into a temporary directory, expand it with pkgutil, and
-// check the payload the installer would lay down under
-// /usr/local/libexec/airlock. No test ever installs the package.
+// AIRLOCK_PACKAGE_TEST=1 on macOS (npm run test:package): they commit a copy
+// of the working tree to a temporary git repository, build a release .pkg
+// there with bin/build-pkg, expand it with pkgutil, and check the payload the
+// installer would lay down under /usr/local/libexec/airlock, and they check
+// the builds bin/build-pkg refuses. No test ever installs the package.
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -26,7 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -43,6 +44,10 @@ const INSTALL_LOCATION = "usr/local/libexec/airlock";
 const BUILD_TIMEOUT_MILLISECONDS = 5 * 60 * 1000;
 const PACKAGE_TESTS_ENABLED =
   process.env.AIRLOCK_PACKAGE_TEST === "1" && process.platform === "darwin";
+const PACKAGE_SUITE_OPTIONS = {
+  skip: !PACKAGE_TESTS_ENABLED && "set AIRLOCK_PACKAGE_TEST=1 on macOS to build the package",
+  timeout: BUILD_TIMEOUT_MILLISECONDS,
+};
 
 const scratch = realpathSync(mkdtempSync(join(tmpdir(), "airlock-package-test-")));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -391,28 +396,103 @@ describe("bin/bump-cask", () => {
 
 // ---- package ----------------------------------------------------------------
 
-describe("bin/build-pkg", {
-  skip: !PACKAGE_TESTS_ENABLED && "set AIRLOCK_PACKAGE_TEST=1 on macOS to build the package",
-  timeout: BUILD_TIMEOUT_MILLISECONDS,
-}, () => {
+// The test runner's environment without GIT_* variables, which git exports to
+// hooks (GIT_DIR, GIT_INDEX_FILE) and which would point every git command here
+// at the developer's repository instead of the one it names.
+const GIT_ISOLATED_ENVIRONMENT = Object.fromEntries(
+  Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")),
+);
+
+// Runs git in a scratch repository, independent of the developer's identity,
+// signing, and hook settings.
+function git(repositoryPath, ...gitArguments) {
+  return execFileSync(
+    "git",
+    [
+      "-C",
+      repositoryPath,
+      "-c",
+      "init.defaultBranch=main",
+      "-c",
+      "user.name=Airlock package test",
+      "-c",
+      "user.email=package-test@airlock.invalid",
+      "-c",
+      "commit.gpgSign=false",
+      "-c",
+      "tag.gpgSign=false",
+      "-c",
+      "core.hooksPath=/dev/null",
+      ...gitArguments,
+    ],
+    { encoding: "utf8", env: GIT_ISOLATED_ENVIRONMENT },
+  );
+}
+
+function commitAll(repositoryPath, message) {
+  git(repositoryPath, "add", "--all");
+  git(repositoryPath, "commit", "--quiet", "--message", message);
+}
+
+// A git repository holding one commit of the checkout's working tree, tracked
+// and untracked files alike, so that bin/build-pkg, which builds only from a
+// clean commit, runs the code under test whether or not it is committed yet.
+function makeBuildRepository(name) {
+  const repositoryPath = makeScratchDirectory(name);
+  const workingTreePaths = execFileSync(
+    "git",
+    ["-C", REPO_ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    { encoding: "utf8", env: GIT_ISOLATED_ENVIRONMENT },
+  )
+    .split("\0")
+    .filter(isSnapshotFile);
+  for (const relativePath of workingTreePaths) {
+    const copyPath = join(repositoryPath, relativePath);
+    mkdirSync(dirname(copyPath), { recursive: true });
+    copyFileSync(join(REPO_ROOT, relativePath), copyPath);
+    chmodSync(copyPath, statSync(join(REPO_ROOT, relativePath)).mode & 0o777);
+  }
+  git(repositoryPath, "init", "--quiet");
+  commitAll(repositoryPath, "Snapshot the working tree");
+  return repositoryPath;
+}
+
+// A deleted tracked file no longer exists, and git lists an untracked nested
+// repository as one directory entry ending in a slash.
+function isSnapshotFile(relativePath) {
+  return relativePath && !relativePath.endsWith("/") && existsSync(join(REPO_ROOT, relativePath));
+}
+
+function packageVersion(repositoryPath) {
+  return JSON.parse(readFileSync(join(repositoryPath, "package.json"), "utf8")).version;
+}
+
+function runBuild(repositoryPath, buildArguments) {
+  return spawnSync(join(repositoryPath, "bin", "build-pkg"), buildArguments, {
+    encoding: "utf8",
+    timeout: BUILD_TIMEOUT_MILLISECONDS,
+  });
+}
+
+describe("bin/build-pkg", PACKAGE_SUITE_OPTIONS, () => {
+  let repositoryPath;
   let packagePath;
   let expandedDirectory;
   let payloadRoot;
   let bomEntries;
 
   before(() => {
+    repositoryPath = makeBuildRepository("release-repository");
+    const version = packageVersion(repositoryPath);
+    git(repositoryPath, "tag", `v${version}`);
+    // An attribute `git archive` honors, which the build must not.
+    writeFileSync(join(repositoryPath, ".git", "info", "attributes"), "* export-ignore\n");
     const outputDirectory = makeScratchDirectory("dist");
-    const build = spawnSync(join(REPO_ROOT, "bin", "build-pkg"), ["--output", outputDirectory], {
-      encoding: "utf8",
-      timeout: BUILD_TIMEOUT_MILLISECONDS,
-    });
+    const build = runBuild(repositoryPath, ["--tag", `v${version}`, "--output", outputDirectory]);
     assert.equal(build.status, 0, `build-pkg failed:\n${build.stdout}\n${build.stderr}`);
 
-    const packageNames = readdirSync(outputDirectory).filter((name) =>
-      /^airlock-\d+\.\d+\.\d+\.pkg$/.test(name),
-    );
-    assert.equal(packageNames.length, 1, `expected one package, found ${packageNames}`);
-    packagePath = join(outputDirectory, packageNames[0]);
+    assert.deepEqual(readdirSync(outputDirectory), [`airlock-${version}.pkg`]);
+    packagePath = join(outputDirectory, `airlock-${version}.pkg`);
 
     expandedDirectory = join(scratch, "expanded");
     const expansion = spawnSync(
@@ -445,11 +525,23 @@ describe("bin/build-pkg", {
       "bin/airlock-attach",
       "runtime/bin/node",
       "runtime/bin/tmux",
+      "runtime/licenses/node/LICENSE",
+      "runtime/licenses/tmux/COPYING",
       "src/server.mjs",
       "node_modules/shiki",
       "config.example.json",
     ]) {
       assert.ok(existsSync(join(payloadRoot, entry)), `${entry} is missing from the payload`);
+    }
+  });
+
+  it("ships the committed files whatever the checkout's git attributes say", () => {
+    for (const relativePath of ["src/server.mjs", "bin/airlock-server", "package.json"]) {
+      assert.deepEqual(
+        readFileSync(join(payloadRoot, relativePath)),
+        readFileSync(join(repositoryPath, relativePath)),
+        `${relativePath} differs from the commit`,
+      );
     }
   });
 
@@ -547,4 +639,99 @@ describe("bin/build-pkg", {
     assert.equal(result.status, 1, `exit ${result.status} ${result.signal}: ${result.stderr}`);
     assert.ok(!result.stderr.includes("nonexistent-airlock-probe"), result.stderr);
   });
+});
+
+describe("bin/build-pkg refusals", PACKAGE_SUITE_OPTIONS, () => {
+  const releaseTag = `v${packageVersion(REPO_ROOT)}`;
+
+  // Builds in a fresh snapshot repository after `prepare` changes it, and
+  // returns the result once it has checked that the build failed and wrote
+  // nothing.
+  function buildAfter(prepare, buildArguments = []) {
+    const suffix = Math.random().toString(36).slice(2);
+    const repositoryPath = makeBuildRepository(`refused-${suffix}`);
+    prepare(repositoryPath);
+    const outputDirectory = makeScratchDirectory(`refused-dist-${suffix}`);
+    const build = runBuild(repositoryPath, [...buildArguments, "--output", outputDirectory]);
+    assert.equal(build.status, 1, `exit ${build.status} ${build.signal}:\n${build.stdout}\n${build.stderr}`);
+    assert.deepEqual(readdirSync(outputDirectory), []);
+    return build;
+  }
+
+  function rewriteRuntimeLock(repositoryPath, rewriteEntry) {
+    const lockPath = join(repositoryPath, "packaging", "runtime.lock");
+    const lines = readFileSync(lockPath, "utf8").split("\n");
+    const rewritten = lines.flatMap((line) =>
+      line === "" || line.startsWith("#") ? [line] : rewriteEntry(line.split(" ")),
+    );
+    writeFileSync(lockPath, rewritten.join("\n"));
+    commitAll(repositoryPath, "Change the runtime lock");
+  }
+
+  it("refuses a working tree with uncommitted changes", () => {
+    const build = buildAfter((repositoryPath) => {
+      writeFileSync(join(repositoryPath, "src", "server.mjs"), "// uncommitted\n", { flag: "a" });
+      writeFileSync(join(repositoryPath, "src", "untracked.mjs"), "export {};\n");
+    });
+    assert.match(build.stderr, /the working tree differs from HEAD/);
+    assert.match(build.stderr, /^ M src\/server\.mjs$/m);
+    assert.match(build.stderr, /^\?\? src\/untracked\.mjs$/m);
+  });
+
+  it("refuses to run a build script that differs from the commit", () => {
+    const build = buildAfter((repositoryPath) => {
+      git(repositoryPath, "update-index", "--skip-worktree", "bin/build-pkg");
+      writeFileSync(join(repositoryPath, "bin", "build-pkg"), "# uncommitted\n", { flag: "a" });
+    });
+    assert.match(build.stderr, /bin\/build-pkg differs from commit [0-9a-f]{40}/);
+  });
+
+  it("refuses a release tag that HEAD is not on", () => {
+    const build = buildAfter((repositoryPath) => {
+      git(repositoryPath, "tag", releaseTag);
+      writeFileSync(join(repositoryPath, "src", "after-release.mjs"), "export {};\n");
+      commitAll(repositoryPath, "Commit after the release");
+    }, ["--tag", releaseTag]);
+    assert.match(build.stderr, /but HEAD is [0-9a-f]{40}; check out the tag/);
+  });
+
+  it("refuses a release tag whose version differs from package.json", () => {
+    const build = buildAfter((repositoryPath) => git(repositoryPath, "tag", "v99.0.0"), [
+      "--tag",
+      "v99.0.0",
+    ]);
+    assert.match(build.stderr, /package\.json's version is \d+\.\d+\.\d+, but the tag is v99\.0\.0/);
+  });
+
+  it("refuses a bundled Homebrew file whose checksum differs from runtime.lock", () => {
+    const build = buildAfter((repositoryPath) =>
+      rewriteRuntimeLock(repositoryPath, ([formula, version, kegPath, sha256]) => [
+        [formula, version, kegPath, kegPath === "bin/tmux" ? "0".repeat(64) : sha256].join(" "),
+      ]),
+    );
+    assert.match(build.stderr, /do not match packaging\/runtime\.lock/);
+    assert.match(build.stderr, /^ {4}bundled, not pinned: tmux \S+ bin\/tmux [0-9a-f]{64}$/m);
+    assert.match(build.stderr, /^ {4}pinned, not bundled: tmux \S+ bin\/tmux 0{64}$/m);
+  });
+
+  for (const [description, isRemovedEntry] of [
+    ["library", ([, , kegPath]) => kegPath.startsWith("lib/")],
+    ["license file", ([formula, , kegPath]) => formula === "tmux" && kegPath === "COPYING"],
+  ]) {
+    it(`refuses a bundled Homebrew ${description} that runtime.lock does not pin`, () => {
+      let removedEntry;
+      const build = buildAfter((repositoryPath) =>
+        rewriteRuntimeLock(repositoryPath, (entry) => {
+          if (removedEntry || !isRemovedEntry(entry)) return [entry.join(" ")];
+          removedEntry = entry.join(" ");
+          return [];
+        }),
+      );
+      assert.ok(removedEntry, `packaging/runtime.lock pins no ${description}`);
+      assert.ok(
+        build.stderr.split("\n").includes(`    bundled, not pinned: ${removedEntry}`),
+        build.stderr,
+      );
+    });
+  }
 });

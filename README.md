@@ -144,16 +144,25 @@ control list entry that allows changing it.
 
 ### From source
 
-Build the package from a checkout (see
+Build the package from a checkout of a release tag (see
 [Building the package](#building-the-package)), then install it the same way:
 
 ```bash
-bin/build-pkg
+git checkout vX.Y.Z
+```
+
+```bash
+bin/build-pkg --tag vX.Y.Z
 ```
 
 ```bash
 sudo installer -pkg dist/airlock-X.Y.Z.pkg -target /
 ```
+
+The build bundles only the Homebrew tmux files that
+[`packaging/runtime.lock`](packaging/runtime.lock) pins. If your Homebrew has
+other versions, the build names them. Pin yours in a local commit, build
+without `--tag`, and install the `airlock-X.Y.Z-dev-<commit>.pkg` it writes.
 
 ### Configure
 
@@ -477,19 +486,39 @@ checkout behind it is a server the agent can rewrite.
 bin/build-pkg
 ```
 
-It writes `dist/airlock-X.Y.Z.pkg`, versioned from `package.json`, and prints
-its path, its SHA-256, and the minimum macOS it declares. `--output DIR`
-writes elsewhere, and `--sign "Developer ID Installer: ..."` signs it. It needs
-the Xcode command-line tools, Homebrew tmux (`brew install tmux`), which it
-bundles with its libraries relinked into the package, the nodejs.org build of
-the Node version in `.tool-versions` (it refuses any other version, and any
-node without the OpenJS Foundation's Developer ID signature, such as
-Homebrew's), and network access for `npm ci`. It writes nothing inside the
+It builds from a commit, never from the working tree: it refuses to start
+while `git status` shows a change or an untracked file, or while the running
+script differs from HEAD's, and it writes the repository's files into the
+stage straight from HEAD's objects, past any local git attribute or filter. It
+writes
+`dist/airlock-X.Y.Z-dev-<commit>.pkg`, versioned from `package.json` and named
+after the commit, and prints its path, the commit, its SHA-256, and the
+minimum macOS it declares. Only a release build (`--tag vX.Y.Z`, under
+[Releasing](#releasing)) gets the name `airlock-X.Y.Z.pkg`, which
+`bin/bump-cask` requires. `--output DIR` writes elsewhere, and
+`--sign "Developer ID Installer: ..."` signs it. It writes nothing inside the
 repository except the output directory.
 
-The package tests build into a temporary directory, expand the result with
-`pkgutil`, and check its layout, ownership, permissions, bundled libraries, and
-launcher. They never install it:
+It needs the Xcode command-line tools, the nodejs.org build of the Node
+version in `.tool-versions` (it refuses any other version, and any node
+without the OpenJS Foundation's Developer ID signature, such as Homebrew's),
+network access for `npm ci`, which checks every dependency against
+`package-lock.json`, and Homebrew tmux (`brew install tmux`). It bundles tmux
+with its libraries relinked into the package and their license files, but only
+the exact files [`packaging/runtime.lock`](packaging/runtime.lock) pins by
+formula, version, path, and SHA-256: another version, a changed file, or a
+file the lock does not list fails the build. After a Homebrew upgrade, the failure prints the
+entries that would pin what the machine has. Check the new versions
+(`brew info tmux`), replace the entries in the lock with those lines, and
+commit the change on its own so it is reviewed as a dependency upgrade.
+
+The package tests commit a copy of the working tree to a temporary git
+repository, build a release there, expand the result with `pkgutil`, and check
+its layout, ownership, permissions, bundled libraries, and launcher. They also
+check that the build refuses uncommitted changes, a build script that differs
+from the commit, a tag that HEAD is not on or that differs from
+`package.json`, and Homebrew files the lock does not pin.
+They never install the package:
 
 ```bash
 npm run test:package
@@ -503,23 +532,27 @@ npm run test:package
    npm version X.Y.Z --no-git-tag-version
    ```
 
-2. Tag the commit and push the tag:
+2. Tag the commit, without pushing the tag yet:
 
    ```bash
    git tag vX.Y.Z
    ```
 
+3. Build the package from the tag:
+
+   ```bash
+   bin/build-pkg --tag vX.Y.Z
+   ```
+
+   It refuses unless the checkout is clean and on that tag, and `package.json`
+   carries its version. If it fails on `runtime.lock`, delete the tag
+   (`git tag -d vX.Y.Z`), commit the new lock entries, and go back to step 2.
+
+4. Push the tag and publish the release with the package attached:
+
    ```bash
    git push origin vX.Y.Z
    ```
-
-3. Build the package:
-
-   ```bash
-   bin/build-pkg
-   ```
-
-4. Publish the release with the package attached:
 
    ```bash
    gh release create vX.Y.Z dist/airlock-X.Y.Z.pkg
@@ -546,7 +579,7 @@ npm run test:package
 | `test/` | The test suite (`node --test`); `npm run test:package` adds the package build tests. |
 | `bin/` | `airlock-server`, the installed launcher; `airlock-attach`, the attach client; `build-pkg` and `bump-cask`, the release tools; and the gitignored helper build `airlock-approve`. |
 | [`airlock-approve.swift`](airlock-approve.swift) | The overlay helper source; builds to the gitignored `bin/airlock-approve`. |
-| [`packaging/`](packaging) | The package's preinstall script. |
+| [`packaging/`](packaging) | The package's preinstall script and `runtime.lock`, the Homebrew files its tmux runtime is built from. |
 | [`Casks/`](Casks) | The Homebrew cask; the repository doubles as its tap. |
 | [`config.example.json`](config.example.json) | The target inventory template; the live copy is `/usr/local/libexec/airlock/config.json`. |
 | [`config.dev.example.json`](config.dev.example.json) | The development instance's local targets; the live copy is the gitignored `config.dev.json`. |
