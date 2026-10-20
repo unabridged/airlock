@@ -3,9 +3,10 @@
 ## Status
 
 Experimental. The hardening review below (2026-08-24) found seven gaps. As of
-2026-10-16, finding 2 is remediated, finding 6 is remediated for command size,
-and the other five are open. Until they are closed, Airlock is an approval gate
-with an audit trail, not a security boundary. Do not rely on it
+2026-10-17, finding 1 is remediated for the packaged install, finding 2 is
+remediated, finding 6 is remediated for command size, and the other four are
+open. Until they are closed, Airlock is an approval gate with an audit trail,
+not a security boundary. Do not rely on it
 as the only thing standing between an agent and a production host.
 
 ## Threat model
@@ -20,10 +21,17 @@ the following assumptions holds. Each one that fails makes the gate decorative.
    `~/.aws`, and keeps the SSH agent socket and Airlock's tmux socket out of
    reach. Claude Code permission deny rules are policy on top of that, not the
    boundary. There is no self-check yet that proves this (finding 7).
-2. **The agent cannot modify the bridge.** The installed server, the approval
-   helper, the configuration, and the state directory are not writable from
-   the agent's sandbox. Today they are, whenever the agent works in this
-   checkout (finding 1).
+2. **The agent cannot modify the bridge.** The packaged install in
+   `/usr/local/libexec/airlock` (the server, its Node and tmux, the approval
+   helper, and the configuration) is owned by root and closed to group and
+   other writes, and the server refuses to start unless it still is (finding
+   1, remediated for the packaged install). The rest still depends on the
+   sandbox: the state directory `~/.local/state/airlock` with its tmux socket;
+   the user-scope registration in `~/.claude.json`, unless the server is
+   registered in `managed-mcp.json` instead; the `env` block of the user
+   settings, which `managed-mcp.json` does not cover; and the SSH
+   configuration and scripts of finding 5. A development instance (`--dev`)
+   runs from a writable checkout and protects nothing.
 3. **The approval text is what gets sent.** A human reading the overlay sees
    exactly the bytes the bridge will paste. The bridge rejects control, ANSI,
    bidirectional, and zero-width characters before the overlay pops, so they
@@ -44,7 +52,7 @@ host's own security; and denial of service beyond the bounds in finding 6.
 ## Hardening review
 
 Date: 2026-08-24  
-Status: Review complete; finding 2 remediated, finding 6 remediated for command size  
+Status: Review complete; finding 1 remediated for the packaged install, finding 2 remediated, finding 6 remediated for command size  
 Scope: Production bridge, native approval helper, terminal drivers, SSH configuration, and deployment assumptions
 
 ## Objective
@@ -57,7 +65,7 @@ The current implementation has strong foundations—argv-only process spawning, 
 
 | Priority | Finding | Primary locations |
 | --- | --- | --- |
-| P1 | The approval helper and server installation can be modified from a writable workspace | `src/approval.mjs:16-29`, `src/approval.mjs:85-92` |
+| P1 | The approval helper and server installation can be modified from a writable workspace (remediated for the packaged install) | `src/install-check.mjs`, `src/launch-options.mjs`, `bin/airlock-server`, `packaging/scripts/preinstall` |
 | P1 | Control and bidirectional characters can make the approval display differ from executed bytes (remediated) | `src/command-contract.mjs` |
 | P1 | Remote output can forge the recognized prompt and trigger false completion | `src/output-stream.mjs:55-87`, `src/drivers/shell.mjs:91-96`, `src/drivers/rails-irb.mjs:85-90` |
 | P2 | Startup readiness uses negative authentication filtering and can adopt the wrong input state | `src/drivers/shell.mjs:160-167`, `src/drivers/rails-irb.mjs:152-180` |
@@ -78,6 +86,127 @@ The fixes should be evaluated against these invariants:
 7. Deployment fails closed when the sandbox requirements cannot be demonstrated.
 
 ## 1. Protect the approval root of trust
+
+### Status
+
+Remediated for the packaged install by `bin/build-pkg`,
+`packaging/scripts/preinstall`, `bin/airlock-server`, `src/launch-options.mjs`,
+and `src/install-check.mjs`. Against the proposed fix:
+
+1. The package installs to `/usr/local/libexec/airlock`, owned by root:wheel
+   with nothing group- or other-writable, instead of a directory under
+   `~/.local/libexec`, which the user and so the agent can write. It bundles
+   Node and tmux under `runtime/`, with tmux's Homebrew libraries copied into
+   `runtime/lib` and relinked to load from there. The configuration moves into
+   the install root as `config.json`, which the admin creates with `sudo` and
+   upgrades keep. The preinstall script installs only on the startup volume
+   and changes nothing when `/usr`, `/usr/local`, `/usr/local/libexec`, or the
+   install root is a symlink, not a directory, not owned by root, group- or
+   other-writable, or has an access control entry that allows changing it.
+2. Root ownership replaces the deny-write rules for the install directory, the
+   configuration, Node, tmux, and the helper. `~/.config/airlock/` is no
+   longer read, and colorization runs in-process (Shiki, from the install's
+   `node_modules`) instead of through Ruby. The state directory still needs
+   sandbox rules, which the README lists.
+3. The checkout cannot run as the production server: it fails the install
+   check, and `bin/airlock-server` refuses to run without the bundled Node. The
+   package is the separately installed immutable copy. A checkout runs only as
+   a development instance (`--dev`), which must name its own configuration and
+   state directory, is refused the production state directory, and marks
+   every overlay with a DEV badge and an "Airlock DEV" title.
+4. `AIRLOCK_CONFIG`, `AIRLOCK_STATE_DIR`, and `AIRLOCK_APPROVE_HELPER` are
+   refused in every mode, before the server resolves any path. Paths come from
+   argv alone, and `--config`, `--state-dir`, and `--approval-helper` require
+   `--dev`. Tests pass paths through those flags or as arguments to
+   `parseLaunchOptions`.
+5. Replaced by root ownership verified at startup, before the server loads the
+   configuration or reads any MCP message: the helper, the directories above
+   it, and everything else the server trusts must be owned by root and closed
+   to group and other writes. Once that holds, only root can replace the
+   helper. No code signature or pinned hash is checked.
+6. The startup check covers the server and launcher as well as the helper:
+   every entry of the install tree (by `lstat`, so any symlink inside the tree
+   is a problem), the install root's ancestors up to `/`, `process.execPath`,
+   the configuration, helper, and tmux by name (so a missing one is reported),
+   and `/usr/bin/ssh`. Symlinks on those paths are followed one hop at a time,
+   checking each directory a hop passes through, up to 40 hops. Every entry
+   checked must also carry no access control entry that allows anyone to
+   write, append, delete, change attributes, security, or owner, or add or
+   delete children, since such a grant bypasses the owner and mode bits. Any
+   problem refuses startup with a message that lists up to 20 of them. The
+   launcher runs under `/bin/sh -p`, resolves its own path through symlinks
+   so a link elsewhere still runs the install it points into, unsets every
+   `NODE_*`, `DYLD_*`, and `OPENSSL_*` variable so the environment cannot
+   load code into Node, and execs the bundled Node. System Integrity
+   Protection already strips `DYLD_*` when it starts `/bin/sh`, so the tests
+   check the launcher's `DYLD_*` filter on its own rather than through a
+   launch. The bundled tmux's ncurses searches `$TERMINFO` before
+   `~/.terminfo`, `$TERMINFO_DIRS`, and its Homebrew prefix, all writable by
+   the user. The bridge's own tmux calls read no terminal description, and the
+   attach scripts set `TERMINFO=/usr/share/terminfo` and switch `TERM` to
+   `xterm-256color` when that directory has no entry for it, so their lookup
+   ends in the system database.
+
+Against the acceptance criteria:
+
+- Every entry of the installed directory is owned by root with no group or
+  other write bit, so a process running as the user cannot replace, rename,
+  chmod, truncate, or create files in it. The package tests check this for the
+  BOM and the expanded payload (`test/package.test.mjs`).
+- Replacing the helper takes root. A helper, or any other entry, that is not
+  owned by root, is group- or other-writable, or has an access control entry
+  that allows changing it makes startup fail closed
+  (`test/install-check.test.mjs`). A root-owned replacement is not detected.
+- Production and development startup reject the retired override variables
+  (`test/launch-options.test.mjs`, and smoke tests that start the server with
+  each one set).
+- The checkout cannot serve as production: the install check refuses it (the
+  smoke test "refuses to run as production from a checkout the user owns"),
+  and so does the launcher (`test/package.test.mjs`). With `--dev` it runs,
+  labeled DEV and on its own state directory.
+
+Residual risks:
+
+- The state directory `~/.local/state/airlock` is writable by the user. It
+  holds the tmux socket, `airlock.lock`, `session.json`, `final-screen`, and
+  the `watch.command` script the overlay's watch button opens in a terminal,
+  outside the sandbox. Every tmux the bridge and its attach clients run names
+  an empty configuration file, so the bridge's tmux server reads none, whichever
+  of them starts it. The bridge replaces its files instead of writing through
+  whatever sits at their paths and opens the lock with `O_NOFOLLOW`, so a
+  symlink planted at one of its file paths redirects none of its writes. The
+  directory itself is followed: a symlink or another directory put in its
+  place in `~/.local/state` receives the socket and every file. An agent that
+  can write or replace the directory can also rewrite `watch.command` before
+  the button runs it or reach the session through the socket, so only the
+  sandbox keeps the agent out of it.
+- The user-scope registration in `~/.claude.json` can name any command,
+  including the installed launcher with `--dev` and a configuration and helper
+  of the agent's choosing. Such a helper can approve every command without
+  showing an overlay, and nothing tells the user: the DEV badge is drawn by the
+  helper, and the development notice in the server's instructions reaches only
+  the agent. Denying the agent writes to `~/.claude.json`, or registering the
+  server in `/Library/Application Support/ClaudeCode/managed-mcp.json`, closes
+  this; the latter costs that file's exclusive control over MCP servers.
+- The launcher strips only `NODE_*`, `DYLD_*`, and `OPENSSL_*`. Everything else,
+  including `PATH`, `BASH_ENV`, and `HOME` (which also moves the state
+  directory and the `~` in the configuration's paths), reaches Node, the tmux
+  server, and the programs in the session. The `env` block of the user
+  settings and of a user-scope registration is therefore trusted input, and
+  `managed-mcp.json` does not protect the user settings.
+- SSH configuration and script targets remain user-owned trusted code
+  (finding 5).
+- Root ownership holds only against an agent that cannot run commands as root,
+  for example through passwordless `sudo`.
+- The check runs once, at startup. A non-root user cannot change root-owned
+  files afterwards, but nothing re-verifies a running server.
+- The package trusts its build machine: the Homebrew tmux and libraries it
+  bundles, the working tree it copies the server from (uncommitted changes
+  included), and the npm registry. Only Node is pinned, to the version in
+  `.tool-versions` and the OpenJS Foundation's Developer ID signature. The
+  package is unsigned unless built with `--sign`. The cask's SHA-256 pins the
+  release asset for Homebrew; a direct download has nothing to check against.
+- A development instance runs from the writable checkout and protects nothing.
 
 ### Risk
 
@@ -297,6 +426,12 @@ Suggested starting limits should be selected for human reviewability, not only m
 
 ## 7. Implement the sandbox self-check
 
+### Status
+
+Open. The startup install check (finding 1) detects a writable installation,
+one of the acceptance criteria below, and refuses to start on it. Nothing yet
+checks the sandbox itself.
+
 ### Risk
 
 The plan correctly identifies the OS sandbox as the primary boundary and requires an observed connectivity failure, but the repository contains no implementation or setup verifier. A schema change, misspelled setting, overly broad workspace permission, localhost forward, or Unix-socket allowance can therefore make the deployment fail open while the README still claims Airlock is the only path.
@@ -324,7 +459,7 @@ The diagnostic should report evidence for each check and fail closed when a chec
 
 ## Recommended implementation order
 
-1. Immediately protect or relocate the installed bridge/helper and disable the mutable checkout as a production MCP server.
+1. Immediately protect or relocate the installed bridge/helper and disable the mutable checkout as a production MCP server. Done for the packaged install (finding 1).
 2. Add command/display validation and size limits.
 3. Reject concurrent approval requests.
 4. Constrain or replace the general SSH configuration.

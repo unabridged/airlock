@@ -1,0 +1,111 @@
+#!/bin/bash
+# Airlock — points the Homebrew cask at a released package.
+#
+#   bin/bump-cask dist/airlock-X.Y.Z.pkg [--cask PATH]
+#
+# Reads the version from the package file name, its sha256 from the file
+# itself, and its minimum macOS from its Distribution, then rewrites the
+# version, sha256, and `depends_on macos:` lines of Casks/airlock.rb (or the
+# cask at PATH) in place. Run it on the exact file attached to the GitHub
+# release, since the cask's sha256 must match what Homebrew downloads.
+set -euo pipefail
+
+REPOSITORY_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+VERSION_LINE='^([[:space:]]*)version "[^"]*"[[:space:]]*$'
+SHA256_LINE='^([[:space:]]*)sha256 ("[0-9a-f]*"|:no_check)[[:space:]]*$'
+MACOS_LINE='^([[:space:]]*)depends_on macos: [^[:space:]]+[[:space:]]*$'
+
+fail() {
+  printf 'bump-cask: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  printf 'usage: bin/bump-cask <airlock-X.Y.Z.pkg> [--cask PATH]\n'
+}
+
+# Fails unless exactly one line of the cask matches the pattern.
+require_single_line() {
+  local line_pattern=$1 line_description=$2 match_count
+  match_count=$(grep -cE -- "$line_pattern" "$cask_path" || true)
+  [[ $match_count == 1 ]] ||
+    fail "$cask_path has $match_count $line_description lines, expected exactly one."
+}
+
+# Prints the Homebrew symbol for a macOS major version.
+macos_release_symbol() {
+  case $1 in
+    27) printf 'golden_gate\n' ;;
+    26) printf 'tahoe\n' ;;
+    15) printf 'sequoia\n' ;;
+    14) printf 'sonoma\n' ;;
+    13) printf 'ventura\n' ;;
+    12) printf 'monterey\n' ;;
+    11) printf 'big_sur\n' ;;
+    *) fail "no Homebrew symbol is known for macOS $1." ;;
+  esac
+}
+
+# Prints the minimum macOS the package's Distribution allows.
+read_package_minimum_macos() {
+  local expansion_directory distribution_minimum
+  expansion_directory=$(mktemp -d)
+  /usr/bin/xar -x -f "$package_path" -C "$expansion_directory" Distribution ||
+    { rm -rf -- "$expansion_directory"; fail "could not read the Distribution of $package_path."; }
+  distribution_minimum=$(sed -n -E 's/.*<os-version min="([0-9.]+)"\/>.*/\1/p' \
+    "$expansion_directory/Distribution")
+  rm -rf -- "$expansion_directory"
+  [[ $distribution_minimum =~ ^[0-9]+(\.[0-9]+)*$ ]] ||
+    fail "the Distribution of $package_path names no single minimum macOS."
+  printf '%s\n' "$distribution_minimum"
+}
+
+package_path=""
+cask_path="$REPOSITORY_ROOT/Casks/airlock.rb"
+while (($#)); do
+  case $1 in
+    --cask)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      cask_path=$2
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage >&2
+      exit 2
+      ;;
+    *)
+      [[ -z $package_path ]] || { usage >&2; exit 2; }
+      package_path=$1
+      shift
+      ;;
+  esac
+done
+[[ -n $package_path ]] || { usage >&2; exit 2; }
+
+[[ -f $package_path ]] || fail "$package_path not found."
+[[ -f $cask_path ]] || fail "$cask_path not found."
+package_file_name=$(basename -- "$package_path")
+[[ $package_file_name =~ ^airlock-([0-9]+\.[0-9]+\.[0-9]+)\.pkg$ ]] ||
+  fail "$package_file_name is not named airlock-X.Y.Z.pkg."
+package_version=${BASH_REMATCH[1]}
+package_sha256=$(shasum -a 256 -- "$package_path" | awk '{ print $1 }')
+[[ $package_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "could not compute the sha256 of $package_path."
+package_minimum_macos=$(read_package_minimum_macos)
+macos_symbol=$(macos_release_symbol "${package_minimum_macos%%.*}")
+
+require_single_line "$VERSION_LINE" version
+require_single_line "$SHA256_LINE" sha256
+require_single_line "$MACOS_LINE" "depends_on macos"
+
+sed -E -i '' \
+  -e "s/$VERSION_LINE/\\1version \"$package_version\"/" \
+  -e "s/$SHA256_LINE/\\1sha256 \"$package_sha256\"/" \
+  -e "s/$MACOS_LINE/\\1depends_on macos: :$macos_symbol/" \
+  "$cask_path"
+
+printf 'Updated %s to version %s, sha256 %s, macOS %s (:%s)\n' "$cask_path" "$package_version" \
+  "$package_sha256" "$package_minimum_macos" "$macos_symbol"

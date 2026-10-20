@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "../src/config.mjs";
 import { explicitHostAliases } from "../src/ssh-config.mjs";
@@ -79,9 +80,29 @@ describe("loadConfig — the real example inventory", () => {
       ["ssh", "ssh", "ssh", "ssh", "script", "script"],
     );
   });
+
+  it("passes validation for the development example exactly as checked in", () => {
+    const config = loadConfig(fileURLToPath(new URL("../config.dev.example.json", import.meta.url)));
+    assert.deepEqual(Object.keys(config.targets), ["local-shell", "local-irb"]);
+    assert.match(config.instructions, /development instance/);
+    const localShell = config.targets["local-shell"];
+    assert.equal(localShell.transport, "script");
+    assert.equal(localShell.script, "/usr/bin/env");
+    assert.deepEqual(localShell.args, ["LANG=en_US.UTF-8", "/bin/bash", "--norc", "--noprofile"]);
+    assert.equal(localShell.driver, "shell");
+    const localIrb = config.targets["local-irb"];
+    assert.equal(localIrb.script, "/usr/bin/env");
+    assert.deepEqual(localIrb.args, localShell.args);
+    assert.deepEqual(localIrb.startup, ["cd /private/tmp", "irb --noautocomplete"]);
+    assert.equal(localIrb.driver, "rails_irb");
+  });
 });
 
 describe("loadConfig — errors name the config path and the problem", () => {
+  it("requires the config path, with no default location", () => {
+    assert.throws(() => loadConfig(), { name: "TypeError", message: "loadConfig requires the config file's path" });
+  });
+
   it("errors on a missing file, naming the path and never falling back", () => {
     const missingPath = join(scratch, "missing", "config.json");
     assert.throws(

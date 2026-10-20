@@ -1,0 +1,562 @@
+#!/bin/bash
+# Airlock — builds the root-installing macOS package.
+#
+#   bin/build-pkg [--output DIR] [--sign "Developer ID Installer: ..."]
+#
+# Stages the install root (/usr/local/libexec/airlock) in a temporary
+# directory: the server source and its production dependencies, the compiled
+# approval overlay helper, and a private runtime made of the nodejs.org node
+# binary that .tool-versions pins and this machine's Homebrew tmux, whose
+# dylibs are copied into runtime/lib and relinked so nothing loads from a
+# user-writable Homebrew prefix. The stage becomes a component package owned
+# by root, wrapped in a product archive limited to Apple silicon and to the
+# oldest macOS every bundled binary supports. The package never ships
+# config.json: the admin creates it with sudo, and upgrades leave it in place.
+#
+# It runs from any directory and writes nothing inside the repository except
+# the output directory (default: dist/).
+set -euo pipefail
+
+REPOSITORY_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+PACKAGE_IDENTIFIER=com.unabridgedsoftware.airlock
+INSTALL_LOCATION=usr/local/libexec/airlock
+# The approval overlay helper's deployment target, not the package's minimum
+# macOS: compute_minimum_macos takes the highest among all bundled binaries.
+HELPER_TARGET=arm64-apple-macos14
+BUNDLED_LIBRARY_PREFIX=@executable_path/../lib
+SYSTEM_TERMINFO=/usr/share/terminfo
+TMUX_CANDIDATES=(/opt/homebrew/bin/tmux /usr/local/bin/tmux)
+# The code requirement every nodejs.org macOS build meets: a Developer ID
+# signature of the OpenJS Foundation's team.
+NODE_SIGNING_REQUIREMENT='anchor apple generic and certificate leaf[subject.OU] = "HX7739G8FX"'
+REQUIRED_TOOLS=(pkgbuild productbuild otool install_name_tool codesign vtool
+  lipo shasum file realpath node npm)
+
+output_directory="$REPOSITORY_ROOT/dist"
+signing_identity=""
+stage_directory=""
+sanity_socket=""
+
+# Bundling state, kept in parallel arrays because /bin/bash 3.2 has no
+# associative arrays.
+bundled_library_names=()
+bundled_library_sources=()
+modified_machos=()
+
+fail() {
+  printf 'build-pkg: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  printf 'usage: bin/build-pkg [--output DIR] [--sign "Developer ID Installer: ..."]\n'
+}
+
+step() {
+  printf '==> %s\n' "$*"
+}
+
+cleanup() {
+  if [[ -n $sanity_socket && -S $sanity_socket ]]; then
+    TERMINFO=$SYSTEM_TERMINFO "$payload_root/runtime/bin/tmux" -S "$sanity_socket" \
+      kill-server 2>/dev/null || true
+  fi
+  if [[ -n $stage_directory ]]; then
+    rm -rf -- "$stage_directory"
+  fi
+}
+
+parse_arguments() {
+  while (($#)); do
+    case $1 in
+      --output)
+        (($# >= 2)) || { usage >&2; exit 2; }
+        output_directory=$2
+        shift 2
+        ;;
+      --sign)
+        (($# >= 2)) || { usage >&2; exit 2; }
+        signing_identity=$2
+        shift 2
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+check_build_machine() {
+  [[ $(uname -s) == Darwin ]] || fail "the package builds only on macOS."
+  local tool
+  for tool in "${REQUIRED_TOOLS[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 ||
+      fail "$tool not found. pkgbuild, productbuild, and codesign ship with macOS; otool, install_name_tool, vtool, and lipo with the Xcode Command Line Tools (xcode-select --install); node and npm with the version in .tool-versions."
+  done
+  [[ -x /usr/bin/swiftc ]] ||
+    fail "/usr/bin/swiftc not found: install the Xcode Command Line Tools (xcode-select --install)."
+}
+
+# Resolves node the way the repository pins it (.tool-versions, read by mise
+# from the repository root) and puts its directory first on PATH, so the
+# bundled binary, the version read, and npm all come from one toolchain.
+# The bundled node must be the official nodejs.org build of the pinned
+# version: its signature proves nobody changed it on this machine, and unlike
+# Homebrew's node it links no Homebrew dylibs.
+resolve_build_node() {
+  local pinned_version node_version
+  node_source=$(cd -- "$REPOSITORY_ROOT" && node -p process.execPath)
+  node_source=$(realpath "$node_source")
+  codesign --verify --strict -R="$NODE_SIGNING_REQUIREMENT" -- "$node_source" 2>/dev/null ||
+    fail "$node_source is not a nodejs.org build signed by the OpenJS Foundation (team HX7739G8FX); build with the node that mise installs for .tool-versions."
+  pinned_version=$(awk '$1 == "nodejs" { print $2 }' "$REPOSITORY_ROOT/.tool-versions")
+  [[ -n $pinned_version ]] || fail "$REPOSITORY_ROOT/.tool-versions pins no nodejs version."
+  node_version=$("$node_source" -p process.version)
+  [[ $node_version == "v$pinned_version" ]] ||
+    fail "$node_source is node $node_version, but .tool-versions pins $pinned_version."
+  PATH="$(dirname -- "$node_source"):$PATH"
+  local reference
+  while IFS= read -r reference; do
+    [[ -n $reference ]] || continue
+    is_system_reference "$reference" ||
+      fail "$node_source loads $reference; build with a self-contained node (the nodejs.org build that mise installs for .tool-versions), not Homebrew's."
+  done < <(list_library_references "$node_source")
+}
+
+read_package_version() {
+  package_version=$(node -e '
+    const { version } = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(typeof version === "string" ? version : "");
+  ' "$REPOSITORY_ROOT/package.json")
+  [[ $package_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    fail "package.json needs a \"version\" of the form X.Y.Z (found \"$package_version\")."
+}
+
+prepare_directories() {
+  mkdir -p -- "$output_directory"
+  output_directory=$(cd -- "$output_directory" && pwd -P)
+  stage_directory=$(mktemp -d "${TMPDIR:-/tmp}/airlock-build-pkg.XXXXXX")
+  stage_directory=$(cd -- "$stage_directory" && pwd -P)
+  payload_root="$stage_directory/root/$INSTALL_LOCATION"
+  mkdir -p -- "$payload_root/bin" "$payload_root/runtime/bin" "$payload_root/runtime/lib" \
+    "$payload_root/runtime/licenses"
+}
+
+stage_source() {
+  step "Staging the server source"
+  cp -RX -- "$REPOSITORY_ROOT/src" "$payload_root/src"
+  local file_name
+  for file_name in package.json package-lock.json config.example.json; do
+    cp -X -- "$REPOSITORY_ROOT/$file_name" "$payload_root/$file_name"
+  done
+  cp -X -- "$REPOSITORY_ROOT/bin/airlock-attach" "$REPOSITORY_ROOT/bin/airlock-server" \
+    "$payload_root/bin/"
+  /usr/bin/find "$payload_root" -name .DS_Store -type f -delete
+}
+
+stage_dependencies() {
+  step "Installing production dependencies"
+  (cd -- "$payload_root" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error)
+  rm -rf -- "$payload_root/node_modules/.bin"
+}
+
+stage_helper() {
+  step "Compiling the approval overlay helper ($HELPER_TARGET)"
+  /usr/bin/swiftc -O -target "$HELPER_TARGET" -o "$payload_root/bin/airlock-approve" \
+    "$REPOSITORY_ROOT/airlock-approve.swift"
+}
+
+stage_node() {
+  step "Bundling node from $node_source"
+  cp -pX -- "$node_source" "$payload_root/runtime/bin/node"
+}
+
+stage_tmux() {
+  local candidate tmux_link=""
+  for candidate in "${TMUX_CANDIDATES[@]}"; do
+    if [[ -e $candidate ]]; then
+      tmux_link=$candidate
+      break
+    fi
+  done
+  [[ -n $tmux_link ]] || fail "tmux not found at ${TMUX_CANDIDATES[*]} (brew install tmux)."
+  tmux_source=$(realpath "$tmux_link")
+  step "Bundling tmux from $tmux_source"
+  cp -X -- "$tmux_source" "$payload_root/runtime/bin/tmux"
+  chmod u+w "$payload_root/runtime/bin/tmux"
+  bundle_library_dependencies "$payload_root/runtime/bin/tmux" "$tmux_source"
+  sign_modified_machos
+}
+
+# Walks the dependency graph breadth first from the tmux binary: every
+# referenced dylib outside /usr/lib and /System is copied into runtime/lib,
+# given an @executable_path install name, and walked in turn.
+bundle_library_dependencies() {
+  local -a queue_paths=("$1") queue_origins=("$2")
+  local queue_index=0
+  while ((queue_index < ${#queue_paths[@]})); do
+    local macho_path=${queue_paths[queue_index]}
+    local origin_path=${queue_origins[queue_index]}
+    local -a references=()
+    read_lines_into references list_library_references "$macho_path"
+    local reference
+    for reference in ${references[@]+"${references[@]}"}; do
+      if is_system_reference "$reference"; then
+        continue
+      fi
+      local source_path library_name
+      source_path=$(resolve_library_reference "$reference" "$origin_path")
+      library_name=$(basename -- "$reference")
+      if ! library_was_bundled "$library_name" "$source_path"; then
+        local library_path="$payload_root/runtime/lib/$library_name"
+        cp -X -- "$source_path" "$library_path"
+        chmod u+w "$library_path"
+        run_install_name_tool -id "$BUNDLED_LIBRARY_PREFIX/$library_name" "$library_path"
+        record_modified_macho "$library_path"
+        bundled_library_names+=("$library_name")
+        bundled_library_sources+=("$source_path")
+        queue_paths+=("$library_path")
+        queue_origins+=("$source_path")
+        printf '    %s <- %s\n' "runtime/lib/$library_name" "$source_path"
+      fi
+      run_install_name_tool -change "$reference" "$BUNDLED_LIBRARY_PREFIX/$library_name" \
+        "$macho_path"
+      record_modified_macho "$macho_path"
+    done
+    delete_non_system_rpaths "$macho_path"
+    queue_index=$((queue_index + 1))
+  done
+}
+
+is_system_reference() {
+  [[ $1 == /usr/lib/* || $1 == /System/* ]]
+}
+
+# Runs a command and stores its non-empty output lines in the named array,
+# reading all of them before the caller changes the file the command read.
+read_lines_into() {
+  local array_name=$1 output_line
+  shift
+  eval "$array_name=()"
+  while IFS= read -r output_line; do
+    [[ -n $output_line ]] || continue
+    eval "$array_name+=(\"\$output_line\")"
+  done < <("$@")
+}
+
+# Prints the install names a Mach-O loads, without its own dylib ID.
+list_library_references() {
+  local own_install_name
+  own_install_name=$(otool -D "$1" | sed -n '2p')
+  otool -L "$1" |
+    sed -n -E 's/^[[:space:]]+(.+) \(compatibility version .*/\1/p' |
+    sort -u |
+    { grep -vxF -- "$own_install_name" || true; }
+}
+
+list_rpaths() {
+  otool -l "$1" | awk '
+    $1 == "cmd" { in_rpath = ($2 == "LC_RPATH"); next }
+    in_rpath && $1 == "path" {
+      sub(/^[[:space:]]*path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; in_rpath = 0
+    }'
+}
+
+# Prints the realpath a reference loads, resolving @loader_path against the
+# referencing file's original location, @executable_path against the tmux
+# binary's, and @rpath against the LC_RPATH entries of both.
+resolve_library_reference() {
+  local reference=$1 origin_path=$2
+  local -a candidates=()
+  case $reference in
+    /*)
+      candidates=("$reference")
+      ;;
+    @loader_path/*)
+      candidates=("$(dirname -- "$origin_path")/${reference#@loader_path/}")
+      ;;
+    @executable_path/*)
+      candidates=("$(dirname -- "$tmux_source")/${reference#@executable_path/}")
+      ;;
+    @rpath/*)
+      local rpath_owner rpath
+      for rpath_owner in "$origin_path" "$tmux_source"; do
+        while IFS= read -r rpath; do
+          [[ -n $rpath ]] || continue
+          rpath=${rpath/#@loader_path/$(dirname -- "$rpath_owner")}
+          rpath=${rpath/#@executable_path/$(dirname -- "$tmux_source")}
+          candidates+=("$rpath/${reference#@rpath/}")
+        done < <(list_rpaths "$rpath_owner")
+      done
+      ;;
+  esac
+  local candidate
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    if [[ $candidate == /* && -f $candidate ]]; then
+      realpath "$candidate"
+      return 0
+    fi
+  done
+  fail "cannot resolve $reference, which $origin_path loads."
+}
+
+# Succeeds when a library of that name is already in runtime/lib, and fails
+# the build when that name came from a different file.
+library_was_bundled() {
+  local library_name=$1 source_path=$2 index
+  for ((index = 0; index < ${#bundled_library_names[@]}; index++)); do
+    if [[ ${bundled_library_names[index]} == "$library_name" ]]; then
+      [[ ${bundled_library_sources[index]} == "$source_path" ]] ||
+        fail "two different libraries are named $library_name: ${bundled_library_sources[index]} and $source_path."
+      return 0
+    fi
+  done
+  return 1
+}
+
+delete_non_system_rpaths() {
+  local -a rpaths=()
+  read_lines_into rpaths list_rpaths "$1"
+  local rpath
+  for rpath in ${rpaths[@]+"${rpaths[@]}"}; do
+    if [[ $rpath == /* ]] && ! is_system_reference "$rpath"; then
+      run_install_name_tool -delete_rpath "$rpath" "$1"
+      record_modified_macho "$1"
+    fi
+  done
+}
+
+# Runs install_name_tool without its expected warning that the change
+# invalidates the code signature; every modified file is re-signed.
+run_install_name_tool() {
+  local error_output
+  if ! error_output=$(install_name_tool "$@" 2>&1); then
+    fail "install_name_tool $*: $error_output"
+  fi
+  if [[ -n $error_output ]]; then
+    printf '%s\n' "$error_output" | { grep -v 'invalidate the code signature' >&2 || true; }
+  fi
+}
+
+record_modified_macho() {
+  local modified_macho
+  for modified_macho in ${modified_machos[@]+"${modified_machos[@]}"}; do
+    [[ $modified_macho == "$1" ]] && return 0
+  done
+  modified_machos+=("$1")
+}
+
+sign_modified_machos() {
+  local modified_macho
+  for modified_macho in ${modified_machos[@]+"${modified_machos[@]}"}; do
+    codesign --force --sign - "$modified_macho" 2>/dev/null ||
+      fail "codesign failed for $modified_macho."
+  done
+}
+
+stage_licenses() {
+  step "Collecting licenses"
+  local node_prefix
+  node_prefix=$(dirname -- "$(dirname -- "$node_source")")
+  copy_license_files node "$node_prefix"
+  local source_path
+  for source_path in "$tmux_source" ${bundled_library_sources[@]+"${bundled_library_sources[@]}"}; do
+    if [[ $source_path =~ ^(.*/Cellar/([^/]+)/[^/]+)/ ]]; then
+      copy_license_files "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+    fi
+  done
+}
+
+# Copies LICENSE* and COPYING* from a component's install prefix into
+# runtime/licenses/<component>, and does nothing when it has none.
+copy_license_files() {
+  local component_name=$1 prefix_directory=$2 license_file
+  local license_directory="$payload_root/runtime/licenses/$component_name"
+  for license_file in "$prefix_directory"/LICENSE* "$prefix_directory"/COPYING*; do
+    [[ -f $license_file ]] || continue
+    mkdir -p -- "$license_directory"
+    cp -X -- "$license_file" "$license_directory/"
+  done
+}
+
+list_payload_machos() {
+  /usr/bin/find "$payload_root" -type f -print0 |
+    xargs -0 /usr/bin/file -N -F $'\t' |
+    awk -F '\t' '$2 ~ /^ *Mach-O/ { sub(/ \(for architecture [^)]*\)$/, "", $1); print $1 }' |
+    sort -u
+}
+
+verify_machos() {
+  step "Verifying bundled Mach-O files"
+  read_lines_into payload_machos list_payload_machos
+  ((${#payload_machos[@]} > 0)) || fail "no Mach-O files found in the payload."
+  local macho_path
+  for macho_path in "${payload_machos[@]}"; do
+    verify_macho_references "$macho_path"
+    lipo -archs "$macho_path" | tr ' ' '\n' | grep -qx arm64 ||
+      fail "${macho_path#"$payload_root"/} has no arm64 slice."
+    codesign --verify --strict "$macho_path" 2>/dev/null ||
+      fail "${macho_path#"$payload_root"/} has an invalid code signature."
+  done
+}
+
+# Fails unless every load command and LC_RPATH entry of a Mach-O points into
+# /usr/lib, /System, or a library bundled in runtime/lib.
+verify_macho_references() {
+  local macho_path=$1 relative_path=${1#"$payload_root"/} reference rpath
+  while IFS= read -r reference; do
+    [[ -n $reference ]] || continue
+    if is_system_reference "$reference"; then
+      continue
+    fi
+    if [[ $reference == "$BUNDLED_LIBRARY_PREFIX"/* &&
+      -f $payload_root/runtime/lib/${reference#"$BUNDLED_LIBRARY_PREFIX"/} &&
+      $relative_path == runtime/* ]]; then
+      continue
+    fi
+    fail "$relative_path loads $reference, outside /usr/lib, /System, and runtime/lib."
+  done < <(list_library_references "$macho_path")
+  while IFS= read -r rpath; do
+    if [[ $rpath == /* ]] && ! is_system_reference "$rpath"; then
+      fail "$relative_path keeps the LC_RPATH $rpath."
+    fi
+  done < <(list_rpaths "$macho_path")
+}
+
+run_sanity_checks() {
+  step "Running the bundled runtime"
+  local tmux_path="$payload_root/runtime/bin/tmux"
+  TERMINFO=$SYSTEM_TERMINFO "$tmux_path" -V || fail "the bundled tmux does not run."
+  "$payload_root/runtime/bin/node" -e 'process.exit(0)' || fail "the bundled node does not run."
+  sanity_socket="$stage_directory/sanity.sock"
+  TERMINFO=$SYSTEM_TERMINFO "$tmux_path" -S "$sanity_socket" -f /dev/null \
+    new-session -d -s airlock-build-sanity /bin/sleep 60 ||
+    fail "the bundled tmux cannot start a session."
+  TERMINFO=$SYSTEM_TERMINFO "$tmux_path" -S "$sanity_socket" has-session -t airlock-build-sanity ||
+    fail "the bundled tmux session did not start."
+  TERMINFO=$SYSTEM_TERMINFO "$tmux_path" -S "$sanity_socket" kill-server
+  rm -f -- "$sanity_socket"
+  sanity_socket=""
+}
+
+# Prints the highest macOS deployment target (LC_BUILD_VERSION minos, or
+# LC_VERSION_MIN_MACOSX version) across the bundled Mach-O files.
+compute_minimum_macos() {
+  local macho_path macho_minimum highest_minimum=0
+  for macho_path in "${payload_machos[@]}"; do
+    macho_minimum=$(vtool -show-build "$macho_path" | awk '
+      $1 == "cmd" { command = $2; platform = "" }
+      command == "LC_BUILD_VERSION" && $1 == "platform" { platform = $2 }
+      command == "LC_BUILD_VERSION" && platform == "MACOS" && $1 == "minos" { print $2 }
+      command == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2 }' |
+      sort -t . -k1,1n -k2,2n -k3,3n | tail -n 1)
+    [[ -n $macho_minimum ]] ||
+      fail "cannot read the minimum macOS of ${macho_path#"$payload_root"/}."
+    highest_minimum=$(printf '%s\n%s\n' "$highest_minimum" "$macho_minimum" |
+      sort -t . -k1,1n -k2,2n -k3,3n | tail -n 1)
+  done
+  printf '%s\n' "$highest_minimum"
+}
+
+normalize_permissions() {
+  step "Normalizing permissions"
+  chmod -R u+rwX,go-w,go+rX "$stage_directory/root"
+  local unsafe_entries symlinks executable_path
+  symlinks=$(/usr/bin/find "$stage_directory/root" -type l)
+  [[ -z $symlinks ]] || fail "the payload contains symlinks:"$'\n'"$symlinks"
+  unsafe_entries=$(/usr/bin/find "$stage_directory/root" \( -perm -020 -o -perm -002 \
+    -o -perm -4000 -o -perm -2000 \))
+  [[ -z $unsafe_entries ]] ||
+    fail "the payload has group- or other-writable or setuid entries:"$'\n'"$unsafe_entries"
+  for executable_path in bin/airlock-server bin/airlock-attach bin/airlock-approve \
+    runtime/bin/node runtime/bin/tmux; do
+    [[ $(stat -f %Lp "$payload_root/$executable_path") == 755 ]] ||
+      fail "$executable_path is not mode 755."
+  done
+}
+
+build_component_package() {
+  step "Building the component package"
+  local scripts_directory="$stage_directory/scripts"
+  mkdir -p -- "$scripts_directory"
+  cp -X -- "$REPOSITORY_ROOT/packaging/scripts/preinstall" "$scripts_directory/preinstall"
+  chmod 755 "$scripts_directory/preinstall"
+  pkgbuild --root "$stage_directory/root" --identifier "$PACKAGE_IDENTIFIER" \
+    --version "$package_version" --install-location / --ownership recommended \
+    --scripts "$scripts_directory" "$stage_directory/airlock-component.pkg"
+}
+
+# Synthesizes the distribution and then pins its title, Apple silicon, the
+# minimum macOS, the system domain, and the absence of a customize pane.
+write_distribution() {
+  local minimum_macos=$1
+  local synthesized_distribution="$stage_directory/synthesized.xml"
+  distribution_path="$stage_directory/distribution.xml"
+  productbuild --synthesize --package "$stage_directory/airlock-component.pkg" \
+    "$synthesized_distribution"
+  awk -v title="Airlock $package_version" -v minimum_macos="$minimum_macos" '
+    /<options[[:space:]]/ {
+      print "    <options customize=\"never\" require-scripts=\"false\" hostArchitectures=\"arm64\"/>"
+      next
+    }
+    { print }
+    /<installer-gui-script[[:space:]>]/ {
+      print "    <title>" title "</title>"
+      print "    <allowed-os-versions>"
+      print "        <os-version min=\"" minimum_macos "\"/>"
+      print "    </allowed-os-versions>"
+      print "    <domains enable_anywhere=\"false\" enable_currentUserHome=\"false\" enable_localSystem=\"true\"/>"
+    }' "$synthesized_distribution" >"$distribution_path"
+  local expected_line
+  for expected_line in "<title>Airlock $package_version</title>" \
+    "hostArchitectures=\"arm64\"" "customize=\"never\"" "<os-version min=\"$minimum_macos\"/>" \
+    "enable_localSystem=\"true\""; do
+    [[ $(grep -cF -- "$expected_line" "$distribution_path") == 1 ]] ||
+      fail "the synthesized distribution did not take $expected_line."
+  done
+}
+
+build_product_archive() {
+  step "Building the product archive"
+  package_path="$output_directory/airlock-$package_version.pkg"
+  rm -f -- "$package_path"
+  local -a signing_arguments=()
+  if [[ -n $signing_identity ]]; then
+    signing_arguments=(--sign "$signing_identity")
+  fi
+  productbuild --distribution "$distribution_path" --package-path "$stage_directory" \
+    ${signing_arguments[@]+"${signing_arguments[@]}"} "$package_path"
+}
+
+main() {
+  parse_arguments "$@"
+  check_build_machine
+  resolve_build_node
+  read_package_version
+  trap cleanup EXIT
+  prepare_directories
+  stage_source
+  stage_dependencies
+  stage_helper
+  stage_node
+  stage_tmux
+  stage_licenses
+  verify_machos
+  run_sanity_checks
+  local minimum_macos
+  minimum_macos=$(compute_minimum_macos)
+  printf '    minimum macOS: %s\n' "$minimum_macos"
+  normalize_permissions
+  build_component_package
+  write_distribution "$minimum_macos"
+  build_product_archive
+  printf '\nBuilt %s\nsha256 %s\n' "$package_path" \
+    "$(shasum -a 256 "$package_path" | awk '{ print $1 }')"
+}
+
+main "$@"

@@ -1,0 +1,30 @@
+#!/bin/sh -p
+# Airlock — MCP server launcher for the packaged install.
+#
+# Claude Code registers this launcher, never node directly, so the server
+# always runs on the node binary bundled in the root-owned install root
+# (/usr/local/libexec/airlock). The -p flag stops the shell from importing
+# functions, SHELLOPTS, or CDPATH from the environment.
+#
+# Before exec'ing node it unsets every NODE_*, DYLD_*, and OPENSSL_* variable:
+# each of them changes what node loads (NODE_OPTIONS --require,
+# DYLD_INSERT_LIBRARIES, OpenSSL providers and config), and the MCP
+# registration and the user's settings can set them.
+set -eu
+
+# A symlink to the launcher elsewhere still runs the install it points into.
+launcher_path=$(/bin/realpath -- "$0")
+install_root=$(/usr/bin/dirname -- "$(/usr/bin/dirname -- "$launcher_path")")
+node_path="$install_root/runtime/bin/node"
+
+for variable_name in $(/usr/bin/env | /usr/bin/sed -n -E 's/^((NODE|DYLD|OPENSSL)_[A-Za-z0-9_]*)=.*/\1/p'); do
+  unset "$variable_name"
+done
+
+if [ ! -x "$node_path" ]; then
+  printf '%s\n' "[airlock] $node_path is missing: this launcher runs only from the installed package." \
+    "[airlock] In a checkout, run src/server.mjs with --dev instead (see README)." >&2
+  exit 1
+fi
+
+exec "$node_path" "$install_root/src/server.mjs" "$@"

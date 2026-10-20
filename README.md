@@ -79,48 +79,251 @@ approved commands. If `open_terminal` refuses because a previous session is
 still alive, attach to it and exit the remote program yourself — leftover
 sessions are never killed automatically.
 
-**Watch the session:** run `bin/airlock-attach` once in Claude Desktop's
-integrated terminal and leave it running. It idles until a session opens,
-attaches to the same PTY The agent drives (you can type into it — e.g. to answer
-SSH host-key or 2FA prompts), and goes back to idling when the session closes.
-Every successful `open_terminal` result carries this command as a one-click
-Run block, so there is no path to remember.
+**Watch the session:** run `/usr/local/libexec/airlock/bin/airlock-attach`
+once in Claude Desktop's integrated terminal and leave it running. It idles
+until a session opens, attaches to the same PTY the agent drives (you can type
+into it — e.g. to answer SSH host-key or 2FA prompts), and goes back to idling
+when the session closes. Every successful `open_terminal` result carries this
+command as a one-click Run block, so there is no path to remember. The
+installed client and the overlay's watch button read only the system terminal
+database, so a terminal whose `TERM` has no entry in `/usr/share/terminfo`
+(such as `xterm-ghostty` or `xterm-kitty`) is attached as `xterm-256color`.
 
-## Setup
+## Install
 
-Requirements: macOS, `tmux`, Node, and the Xcode command-line tools (for
-`swiftc`).
+Requirements: macOS 26 (Tahoe) or later on Apple silicon, an admin account
+(installing and editing the config need `sudo`), and Claude Code. The package
+declares the newest minimum among the binaries it bundles, and the tmux
+libraries it copies from the build machine's Homebrew (ncurses in particular)
+are built for macOS 26. The installer enforces that minimum, and the cask
+declares the same one, so Homebrew refuses an older macOS before it downloads
+anything.
 
-1. Install dependencies and build the approval overlay helper:
+Airlock installs as a macOS package into `/usr/local/libexec/airlock`, owned by
+root, with its own Node and tmux. Replace `X.Y.Z` below with the release
+version.
+
+### Homebrew
+
+The repository doubles as a Homebrew tap:
+
+```bash
+brew tap unabridged/airlock https://github.com/unabridged/airlock
+```
+
+```bash
+brew install --cask unabridged/airlock/airlock
+```
+
+While the repository is private, the tap has to be cloned over SSH:
+
+```bash
+brew tap unabridged/airlock git@github.com:unabridged/airlock.git
+```
+
+Homebrew still cannot download a private release asset, so install the
+[direct package](#direct-package) instead.
+
+### Direct package
+
+Download a release's package with the GitHub CLI, then install it:
+
+```bash
+gh release download vX.Y.Z -R unabridged/airlock -p 'airlock-*.pkg'
+```
+
+```bash
+sudo installer -pkg airlock-X.Y.Z.pkg -target /
+```
+
+The installer installs only on the startup volume. It changes nothing when
+`/usr`, `/usr/local`, `/usr/local/libexec`, or the install directory is a
+symlink, is not a root-owned directory closed to group and other writes (such
+as a `/usr/local` an older Homebrew handed to your user), or has an access
+control list entry that allows changing it.
+
+### From source
+
+Build the package from a checkout (see
+[Building the package](#building-the-package)), then install it the same way:
+
+```bash
+bin/build-pkg
+```
+
+```bash
+sudo installer -pkg dist/airlock-X.Y.Z.pkg -target /
+```
+
+### Configure
+
+The targets live in `/usr/local/libexec/airlock/config.json`, which the package
+never ships or overwrites. Until it exists the server refuses to start, reports
+it missing, and prints the command below. Start from the shipped example:
+
+```bash
+sudo cp /usr/local/libexec/airlock/config.example.json /usr/local/libexec/airlock/config.json
+```
+
+Edit it with `sudo -e`, which runs your editor as you on a temporary copy and
+writes the result back as root:
+
+```bash
+sudo -e /usr/local/libexec/airlock/config.json
+```
+
+The file is root-owned on purpose: it names the hosts and programs every
+approval reaches, so whatever can rewrite it can redirect an approved command.
+
+A target is reached either over SSH (`ssh_host` names an explicit `Host` alias
+from the SSH config that `ssh_config` names) or, with `"transport": "script"`,
+by running a local executable you name (`script`, tilde allowed, plus
+whitespace-free `args`) — typically a project's own connection helper, such as
+a `bin/shell staging` that wraps `aws ecs execute-command` into a Fargate task.
+Either kind takes optional startup lines, and `display_command` must spell out
+exactly what the bridge runs (the `ssh` line or the script line, then each
+startup line); the bridge refuses to start on a config it cannot fully
+validate.
+
+Root ownership covers this file only. The SSH config and the scripts it points
+at stay yours, writable by you and so by the agent, and remain trusted code:
+the overlay shows the alias or the script line, not what they do. Keep them out
+of the agent's reach ([SECURITY.md](SECURITY.md), finding 5).
+
+### Register
+
+Register the installed server user-scope as MCP server `airlock`:
+
+```bash
+claude mcp add --scope user airlock -- /usr/local/libexec/airlock/bin/airlock-server
+```
+
+Then block the direct path ([below](#block-the-direct-path)). Without it the
+gate is decorative.
+
+### Managed registration (optional)
+
+The user-scope registration lives in `~/.claude.json`, which the agent can
+rewrite as easily as you can. An admin can register the server in Claude Code's
+managed MCP file instead, which only an administrator can write:
+
+```bash
+sudo mkdir -p "/Library/Application Support/ClaudeCode"
+```
+
+```bash
+sudo -e "/Library/Application Support/ClaudeCode/managed-mcp.json"
+```
+
+```json
+{
+  "mcpServers": {
+    "airlock": {
+      "type": "stdio",
+      "command": "/usr/local/libexec/airlock/bin/airlock-server"
+    }
+  }
+}
+```
+
+**This file takes exclusive control of MCP.** While it exists, Claude Code
+loads only the servers it lists: user, project, local, plugin, and
+`--mcp-config` servers stop loading, `claude mcp add` refuses to add any, and
+claude.ai connectors and Claude in Chrome stay off unless managed settings
+allow them. Use it only when every MCP server you need can live in that file.
+It protects the registration only; the `env` block in your user settings stays
+yours ([SECURITY.md](SECURITY.md), threat model assumption 2).
+
+### Why root-owned
+
+The agent runs as you, so anything you can write, the agent can rewrite: the
+server, the overlay helper whose answer is the approval, the config that names
+the targets, and the Node and tmux that run them. A checkout or an install
+under your home directory leaves the gate one file edit away. Owned by root and
+closed to group and other writes, the install is out of the agent's reach
+without relying on a sandbox rule.
+
+The server verifies this at every start, before it reads the config or answers
+Claude Code. It checks the whole install tree, the directories above it, its
+own Node, the config, helper, and tmux, and `/usr/bin/ssh`, and refuses to
+start if any entry is not owned by root, is group- or other-writable, has an
+access control list entry that allows changing it, or is a symlink inside the
+install tree. The launcher also clears every `NODE_*`, `DYLD_*`, and
+`OPENSSL_*` variable, so the launch environment cannot load code into the
+bundled Node. A checkout fails the check, so it runs only as a
+development instance ([Development](#development)).
+
+### Upgrade, rollback, and uninstall
+
+Close any open Airlock session before installing over it, and restart Claude
+Code afterwards so the server relaunches from the new files. Every install
+first removes the previous version's files and keeps `config.json`.
+
+To upgrade, run `brew upgrade --cask airlock`, or install the newer release's
+package with `sudo installer` as above:
+
+```bash
+brew upgrade --cask airlock
+```
+
+To roll back, install the older release's package with `sudo installer`. The
+cask always points at the latest release, so a Homebrew install rolls back
+through the direct package too.
+
+To uninstall with Homebrew, which keeps `config.json`:
+
+```bash
+brew uninstall --cask airlock
+```
+
+To also remove `config.json` and the install directory and move
+`~/.local/state/airlock` to the Trash:
+
+```bash
+brew uninstall --zap --cask airlock
+```
+
+To uninstall a direct package, forget its receipt and remove the install
+directory. This deletes `config.json` too, so copy it out first to keep it:
+
+```bash
+sudo pkgutil --forget com.unabridgedsoftware.airlock
+```
+
+```bash
+sudo rm -rf /usr/local/libexec/airlock
+```
+
+Either way, remove the registration afterwards:
+
+```bash
+claude mcp remove --scope user airlock
+```
+
+### Moving from a checkout install
+
+A checkout registered as `node <checkout>/src/server.mjs` now refuses to start.
+Close any open session, install the package (above), then:
+
+1. Review `~/.config/airlock/config.json` before carrying it over. The bridge
+   no longer reads it, and while it was writable by you it was writable by the
+   agent, so check every target, its `script`, and `ssh_config`.
+
+2. Install it as the root-owned config:
 
    ```bash
-   npm install && mkdir -p bin && /usr/bin/swiftc -O -o bin/airlock-approve airlock-approve.swift
+   sudo install -m 644 -o root -g wheel ~/.config/airlock/config.json /usr/local/libexec/airlock/config.json
    ```
 
-   Nothing rebuilds the helper for you, so rerun the `swiftc` step whenever
-   `airlock-approve.swift` changes, a pull included. Until you do, the server
-   warns at startup and whenever `open_terminal` asks for approval.
-
-2. Create `~/.config/airlock/config.json` from
-   [`config.example.json`](config.example.json). A target is reached either
-   over SSH (`ssh_host` names an explicit `Host` alias from your
-   `~/.ssh/config`) or, with `"transport": "script"`, by running a local
-   executable you name (`script`, tilde allowed, plus whitespace-free
-   `args`) — typically a project's own connection helper, such as a
-   `bin/shell staging` that wraps `aws ecs execute-command` into a Fargate
-   task. Either kind takes optional startup lines, and `display_command`
-   must spell out exactly what the bridge runs (the `ssh` line or the script
-   line, then each startup line); the bridge refuses to start on a config it
-   cannot fully validate. A script's contents are trusted exactly like your
-   SSH config: the overlay shows the script line, not what the script does.
-
-3. Register the bridge user-scope as MCP server `airlock`:
+3. Replace the registration:
 
    ```bash
-   claude mcp add --scope user airlock -- node "$(pwd)/src/server.mjs"
+   claude mcp remove --scope user airlock
    ```
 
-4. Block the direct path (next section). Without it the gate is decorative.
+   ```bash
+   claude mcp add --scope user airlock -- /usr/local/libexec/airlock/bin/airlock-server
+   ```
 
 ## Block the direct path
 
@@ -135,6 +338,13 @@ approvals are decorative:
   scripts;
 - deny reads of `~/.ssh` and `~/.aws`, and keep the SSH agent socket and
   Airlock's tmux socket out of any Unix-socket allowlist;
+- deny reads and writes of the state directory `~/.local/state/airlock`, and
+  writes that rename or replace it in `~/.local/state`: the bridge follows a
+  symlink or a substitute directory at that path. It holds the tmux socket, the
+  lock, the session file, the closed session's final screen, and the
+  `watch.command` script the overlay's watch button opens in a terminal. The
+  bridge runs as you, so the directory is necessarily writable by you, and only
+  the sandbox keeps the agent out;
 - deny network egress to the target hosts at the sandbox level, and test it: a
   sandboxed connection attempt to a configured host must fail.
 
@@ -159,7 +369,9 @@ self-check yet that proves the sandbox actually cuts off the remote path
       "Read(~/.ssh/**)",
       "Edit(~/.ssh/**)",
       "Read(~/.aws/**)",
-      "Edit(~/.aws/**)"
+      "Edit(~/.aws/**)",
+      "Read(~/.local/state/airlock/**)",
+      "Edit(~/.local/state/airlock/**)"
     ]
   }
 ```
@@ -189,22 +401,155 @@ approvals off.
 
 ## Development
 
+### Tests
+
+Development needs the Node version in `.tool-versions`, Homebrew tmux, and the
+Xcode command-line tools (for `swiftc`). Install the dependencies, build the
+approval overlay helper, and run the suite:
+
 ```bash
-node --test "test/*.test.mjs"
+npm install
+```
+
+```bash
+/usr/bin/swiftc -O -o bin/airlock-approve airlock-approve.swift
+```
+
+```bash
+node --test
 ```
 
 The suite includes live local tmux + IRB integration tests; no approval
-panels pop and no remote connections are made. Rebuild the helper (step 1
-above) after editing or pulling changes to `airlock-approve.swift`.
+panels pop and no remote connections are made. Nothing rebuilds the helper
+for you, so rerun the `swiftc` step whenever `airlock-approve.swift` changes,
+a pull included. Until you do, a development instance warns at startup and
+whenever `open_terminal` asks for approval.
+
+### Development instance
+
+A checkout fails the install check, so it runs only as a development instance,
+alongside the installed one. From the checkout root, copy the example config,
+whose two targets are a local bash shell and a local IRB console:
+
+```bash
+cp config.dev.example.json config.dev.json
+```
+
+Then register the checkout for this project only:
+
+```bash
+claude mcp add --scope local airlock-dev -- "$(node -p process.execPath)" "$(pwd)/src/server.mjs" --dev --config "$(pwd)/config.dev.json" --state-dir "$(pwd)/.airlock-state"
+```
+
+What `--dev` changes:
+
+- There is no install check, so a development instance protects nothing: the
+  agent can edit the server it talks to. Give it local targets only.
+- `--config` and `--state-dir` are required, and relative paths resolve against
+  the checkout, not the working directory. `--approval-helper` is optional and
+  defaults to the checkout's `bin/airlock-approve`.
+- The production state directory is refused however it is spelled, so the
+  instance has its own lock, tmux socket, and session file and runs while the
+  installed server holds its own. Keep the checkout path short: macOS caps a
+  Unix socket path at 104 bytes.
+- It drives Homebrew's tmux (`/opt/homebrew/bin/tmux`, then
+  `/usr/local/bin/tmux`, then `tmux` on `PATH`) instead of a bundled one.
+- Every overlay carries a DEV badge and an "Airlock DEV" title, and the
+  server's instructions tell the agent it is a development instance and which
+  config its targets come from.
+- Its attach command names the state directory. Every `open_terminal` result
+  carries the absolute form; from the checkout root it is:
+
+  ```bash
+  bin/airlock-attach --state-dir .airlock-state
+  ```
+
+- `AIRLOCK_CONFIG`, `AIRLOCK_STATE_DIR`, and `AIRLOCK_APPROVE_HELPER` are
+  refused here as in production; pass the flags instead.
+
+Never register a checkout as `airlock`, even with `--dev`. That name belongs
+to the installed server your CLAUDE.md and permission rules trust, and a
+checkout behind it is a server the agent can rewrite.
+
+### Building the package
+
+```bash
+bin/build-pkg
+```
+
+It writes `dist/airlock-X.Y.Z.pkg`, versioned from `package.json`, and prints
+its path, its SHA-256, and the minimum macOS it declares. `--output DIR`
+writes elsewhere, and `--sign "Developer ID Installer: ..."` signs it. It needs
+the Xcode command-line tools, Homebrew tmux (`brew install tmux`), which it
+bundles with its libraries relinked into the package, the nodejs.org build of
+the Node version in `.tool-versions` (it refuses any other version, and any
+node without the OpenJS Foundation's Developer ID signature, such as
+Homebrew's), and network access for `npm ci`. It writes nothing inside the
+repository except the output directory.
+
+The package tests build into a temporary directory, expand the result with
+`pkgutil`, and check its layout, ownership, permissions, bundled libraries, and
+launcher. They never install it:
+
+```bash
+npm run test:package
+```
+
+### Releasing
+
+1. Bump the version in `package.json` and `package-lock.json`, and commit it:
+
+   ```bash
+   npm version X.Y.Z --no-git-tag-version
+   ```
+
+2. Tag the commit and push the tag:
+
+   ```bash
+   git tag vX.Y.Z
+   ```
+
+   ```bash
+   git push origin vX.Y.Z
+   ```
+
+3. Build the package:
+
+   ```bash
+   bin/build-pkg
+   ```
+
+4. Publish the release with the package attached:
+
+   ```bash
+   gh release create vX.Y.Z dist/airlock-X.Y.Z.pkg
+   ```
+
+5. Point the cask at that exact file, since its SHA-256 must match what
+   Homebrew downloads:
+
+   ```bash
+   bin/bump-cask dist/airlock-X.Y.Z.pkg
+   ```
+
+   It also copies the package's minimum macOS into the cask's
+   `depends_on macos:` line.
+
+6. Commit and push `Casks/airlock.rb`. The tap reads the cask from the
+   default branch.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `src/` | The bridge: MCP stdio server, config + ssh-config validation, private-socket tmux layer, session manager, output extraction, shell + rails_irb drivers, overlay approval gate, colorizer. |
-| `test/` | The test suite (`node --test`). |
+| `src/` | The bridge: MCP stdio server, launch options and install check, config + ssh-config validation, private-socket tmux layer, session manager, output extraction, shell + rails_irb drivers, overlay approval gate, colorizer. |
+| `test/` | The test suite (`node --test`); `npm run test:package` adds the package build tests. |
+| `bin/` | `airlock-server`, the installed launcher; `airlock-attach`, the attach client; `build-pkg` and `bump-cask`, the release tools; and the gitignored helper build `airlock-approve`. |
 | [`airlock-approve.swift`](airlock-approve.swift) | The overlay helper source; builds to the gitignored `bin/airlock-approve`. |
-| [`config.example.json`](config.example.json) | The target inventory template; the live copy is `~/.config/airlock/config.json`. |
+| [`packaging/`](packaging) | The package's preinstall script. |
+| [`Casks/`](Casks) | The Homebrew cask; the repository doubles as its tap. |
+| [`config.example.json`](config.example.json) | The target inventory template; the live copy is `/usr/local/libexec/airlock/config.json`. |
+| [`config.dev.example.json`](config.dev.example.json) | The development instance's local targets; the live copy is the gitignored `config.dev.json`. |
 | [`PLAN.md`](PLAN.md) | The build plan, kept as a design reference. |
 | [`SECURITY.md`](SECURITY.md) | The threat model, the assumptions the gate depends on, and the open findings from the hardening review. |
 | `spikes/` | Historical validation spikes for the approval dialog and overlay. |

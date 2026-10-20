@@ -12,7 +12,13 @@
 // only ever ends access, never extends it) and the ungated, read-only
 // list_targets. The protocol layer knows nothing of tmux; everything
 // terminal-shaped goes through the session manager.
+//
+// Launched bare, the server is the production instance and runs only from a
+// root-owned installation; `--dev` runs a development instance from a
+// checkout (see {parseLaunchOptions}).
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { approvalHelperProblem, requestApproval } from "./approval.mjs";
 import { currentClaudeSessionTitle } from "./claude-session.mjs";
@@ -21,42 +27,73 @@ import {
   CONTRACT_SPEC_TEXT,
   formatContractViolations,
 } from "./command-contract.mjs";
-import { CONFIG_PATH, loadConfig, transportCommandLine } from "./config.mjs";
+import { loadConfig, transportCommandLine } from "./config.mjs";
+import { installationProblems, refusalText } from "./install-check.mjs";
+import { parseLaunchOptions, USAGE_TEXT, UsageError } from "./launch-options.mjs";
 import { isExpectedSessionError, SessionManager } from "./session-manager.mjs";
+import { Tmux } from "./tmux.mjs";
 
-const SERVER_INFO = { name: "airlock", version: "1.0.0" };
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
 
 function log(...parts) {
   process.stderr.write(`[airlock] ${parts.join(" ")}\n`);
 }
 
-// ---- startup: config is load-bearing; fail loudly, never fall back --------
+// ---- startup: every input is load-bearing; fail loudly, never fall back ---
 
-let config;
-// AIRLOCK_STATE_DIR is a test-only override (like AIRLOCK_APPROVE_HELPER):
-// it relocates the single-instance lock, session state, and tmux socket so
-// test servers never collide with a real bridge. Undefined means the real
-// state directory (the callee defaults).
-const stateDirectory = process.env.AIRLOCK_STATE_DIR || undefined;
-try {
-  // AIRLOCK_CONFIG is a test-only override (like AIRLOCK_APPROVE_HELPER);
-  // the real config lives at CONFIG_PATH and nowhere else. No lock here:
-  // every Claude session's bridge must start (discovery works everywhere);
-  // the exclusive session lock is taken per open_terminal, in the manager.
-  config = loadConfig(process.env.AIRLOCK_CONFIG || CONFIG_PATH);
-} catch (err) {
-  process.stderr.write(`[airlock] startup failed: ${err.message}\n`);
+function exitWithStartupFailure(message) {
+  process.stderr.write(`[airlock] startup failed: ${message}\n`);
   process.exit(1);
 }
 
-// The session manager constructs its own terminal layer (Tmux); the protocol
-// layer never touches tmux/output-stream directly.
-const sessionManager = new SessionManager({ config, stateDirectory });
+let launchOptions;
+try {
+  launchOptions = parseLaunchOptions(process.argv.slice(2));
+} catch (err) {
+  exitWithStartupFailure(err instanceof UsageError ? `${err.message}\n${USAGE_TEXT}` : err.message);
+}
+
+// A production instance runs only once nothing it trusts is writable by the
+// user the agent runs as — checked before the config is read and before any
+// MCP traffic is answered.
+if (!launchOptions.dev) {
+  const problems = installationProblems(launchOptions);
+  if (problems.length > 0) {
+    process.stderr.write(refusalText(launchOptions, problems));
+    process.exit(1);
+  }
+}
+
+// Marks a development instance's approval panels so they are never mistaken
+// for the production gate.
+const INSTANCE_LABEL = launchOptions.dev ? "DEV" : null;
+
+let config;
+let serverVersion;
+try {
+  serverVersion = JSON.parse(readFileSync(join(launchOptions.installRoot, "package.json"), "utf8")).version;
+  // No lock here: every Claude session's bridge must start (discovery works
+  // everywhere); the exclusive session lock is taken per open_terminal, in
+  // the manager.
+  config = loadConfig(launchOptions.configPath);
+} catch (err) {
+  exitWithStartupFailure(err.message);
+}
+
+const SERVER_INFO = { name: "airlock", version: serverVersion };
+
+// The protocol layer hands the terminal layer to the session manager and
+// never touches tmux/output-stream itself.
+const sessionManager = new SessionManager({
+  config,
+  stateDirectory: launchOptions.stateDirectory,
+  tmux: Tmux.forLaunch(launchOptions),
+  attachCommandLine: launchOptions.attachCommandLine,
+});
 
 // A missing helper is a call-time non-approval by contract, but the
 // misconfiguration should be named at registration time, not mid-workflow.
-const helperProblem = approvalHelperProblem();
+const helperProblem = approvalHelperProblem({ helperPath: launchOptions.approvalHelperPath });
 if (helperProblem) log(`warning: ${helperProblem}`);
 
 // Fallback identity for the overlay header, learned from initialize
@@ -191,6 +228,7 @@ function handleInitialize(id, params) {
     // Behavioral guidance + the target inventory, one line each — this is
     // what makes proactive use work in every session, tuned via config.
     instructions:
+      developmentInstanceNotice() +
       `${config.instructions}\n\n` +
       `After a successful open_terminal, relay the attach block from its result ` +
       `verbatim as its own bash-fenced code block — the app renders a Run button ` +
@@ -198,6 +236,14 @@ function handleInitialize(id, params) {
       `${CONTRACT_SPEC_TEXT}\n\n` +
       `Configured targets:\n${targetInventoryLines().join("\n")}`,
   });
+}
+
+function developmentInstanceNotice() {
+  if (!launchOptions.dev) return "";
+  return (
+    `This is a development instance of Airlock (--dev), whose targets come from ` +
+    `${launchOptions.configPath}.\n\n`
+  );
 }
 
 // ---- the gate -------------------------------------------------------------
@@ -215,6 +261,8 @@ async function approveOrExplain({ command, badge, actionDescription }) {
     // The overlay's 👀 button approves AND opens the terminal on the session
     // by handing this script to /usr/bin/open.
     watchCommandPath: sessionManager.watchScriptPath,
+    helperPath: launchOptions.approvalHelperPath,
+    instanceLabel: INSTANCE_LABEL,
   });
   return approval;
 }
@@ -236,7 +284,7 @@ function approverNote(approval) {
 // open that asks for approval repeats it in the result, where the model sees
 // it and can relay it.
 function helperProblemNote() {
-  const problem = approvalHelperProblem();
+  const problem = approvalHelperProblem({ helperPath: launchOptions.approvalHelperPath });
   return problem ? `\n\nSetup warning: ${problem}` : "";
 }
 
@@ -519,4 +567,8 @@ rl.on("close", () => {
   process.exit(0);
 });
 
-log(`ready (pid ${process.pid}, ${Object.keys(config.targets).length} targets)`);
+log(
+  `ready (${launchOptions.dev ? "development" : "production"} instance, ` +
+    `config ${launchOptions.configPath}, pid ${process.pid}, ` +
+    `${Object.keys(config.targets).length} targets)`,
+);

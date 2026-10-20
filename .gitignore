@@ -1,5 +1,9 @@
 bin/airlock-approve
 spikes/
 node_modules/
+config.dev.json
+.airlock-state/
+dist/
+build/
 
 design/

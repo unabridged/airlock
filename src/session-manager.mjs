@@ -14,23 +14,25 @@ import { fileURLToPath } from "node:url";
 import { createRailsIrbDriver } from "./drivers/rails-irb.mjs";
 import { createShellDriver } from "./drivers/shell.mjs";
 import { PaneStateError, paneSnapshot, waitForReadyPrompt } from "./output-stream.mjs";
-import { ensurePrivateDirectory, STATE_DIRECTORY, Tmux } from "./tmux.mjs";
+import { ensurePrivateDirectory, replaceFile, STATE_DIRECTORY, Tmux } from "./tmux.mjs";
 
 const SSH_EXECUTABLE = "/usr/bin/ssh";
 const GRACEFUL_CLOSE_TIMEOUT_MS = 4000;
 
-// The attach client the human runs in Claude Desktop's integrated terminal,
-// resolved from this module's own location. Its PATH appears in model-facing
-// results as a ready-to-run block — a deliberate, narrow exception to "no
-// transport details in results": the script encapsulates the socket and
-// session name, so the path itself carries neither, and the human gets
-// one-click eyes on the session instead of having to remember the command.
-export const ATTACH_CLIENT_PATH = fileURLToPath(new URL("../bin/airlock-attach", import.meta.url));
+// The command line that runs the attach client the human uses in Claude
+// Desktop's integrated terminal. It appears in model-facing results as a
+// ready-to-run block — a deliberate, narrow exception to "no transport
+// details in results": the script encapsulates the socket and session name,
+// so the line carries neither (a development instance's names only its state
+// directory), and the human gets one-click eyes on the session instead of
+// having to remember the command. The launch options supply the line; this
+// default is the client beside this module.
+const DEFAULT_ATTACH_COMMAND_LINE = fileURLToPath(new URL("../bin/airlock-attach", import.meta.url));
 
 // A bash-fenced block renders with a Run button in the Claude apps — the
 // instruction around it tells the model to relay it verbatim.
-function attachBlockText(leadIn) {
-  return `${leadIn}\n\n\`\`\`bash\n${ATTACH_CLIENT_PATH}\n\`\`\``;
+function attachBlockText(attachCommandLine, leadIn) {
+  return `${leadIn}\n\n\`\`\`bash\n${attachCommandLine}\n\`\`\``;
 }
 
 // The `ssh` transport's launch command: `ssh <validated alias>` (host from
@@ -98,7 +100,8 @@ function sleepSynchronously(milliseconds) {
 // death, SIGKILL included — so no stale-lock state exists to detect or clear
 // (a pidfile's read-check-delete cycle is a race two bridges can both win).
 // The lock file itself is permanent; its content, the holder's pid, is
-// advisory display metadata only.
+// advisory display metadata only. O_NOFOLLOW refuses a symlink planted in its
+// place rather than locking and truncating the file it points to.
 export function acquireSessionLock(stateDirectory = STATE_DIRECTORY) {
   ensurePrivateDirectory(stateDirectory);
   const lockFile = join(stateDirectory, "airlock.lock");
@@ -107,7 +110,7 @@ export function acquireSessionLock(stateDirectory = STATE_DIRECTORY) {
     try {
       lockDescriptor = openSync(
         lockFile,
-        constants.O_RDWR | constants.O_CREAT | O_EXLOCK | constants.O_NONBLOCK,
+        constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | O_EXLOCK | constants.O_NONBLOCK,
         0o600,
       );
       break;
@@ -186,9 +189,11 @@ export class SessionManager {
     stateDirectory = STATE_DIRECTORY,
     tmux = new Tmux({ socketPath: join(stateDirectory, "tmux.sock") }),
     buildLaunchArgv: launchArgvBuilder = buildLaunchArgv,
+    attachCommandLine = DEFAULT_ATTACH_COMMAND_LINE,
   }) {
     this.config = config;
     this.tmux = tmux;
+    this.attachCommandLine = attachCommandLine;
     this.buildLaunchArgv = launchArgvBuilder;
     this.stateDirectory = stateDirectory;
     this.sessionStateFile = join(stateDirectory, "session.json");
@@ -212,8 +217,8 @@ export class SessionManager {
   }
 
   // The one-shot attach script the approval overlay's 👀 button opens — the
-  // approve-and-watch path, as opposed to {ATTACH_CLIENT_PATH}, the looping
-  // client the model relays after open_terminal.
+  // approve-and-watch path, as opposed to {SessionManager#attachCommandLine},
+  // the looping client the model relays after open_terminal.
   get watchScriptPath() {
     return this.tmux.watchCommandPath;
   }
@@ -288,10 +293,10 @@ export class SessionManager {
           // The state file lands BEFORE {activeSession} exists: if this write
           // fails, the catch below leaves the bridge fully closed — never
           // "session live but lock released".
-          writeFileSync(
+          replaceFile(
             this.sessionStateFile,
             JSON.stringify({ target: targetKey, pid: process.pid, opened_at: new Date().toISOString() }),
-            { mode: 0o600 },
+            0o600,
           );
         } catch (err) {
           // Best-effort reap of this call's OWN newborn session (never a
@@ -314,11 +319,12 @@ export class SessionManager {
 
         this.activeSession = { targetKey, target, driver, releaseSessionLock };
         // The result carries no socket path, session id, or tmux syntax (PLAN:
-        // goal 5 / output capture) — only the attach-client path, which
+        // goal 5 / output capture) — only the attach command line, which
         // encapsulates all of those.
         return (
           `Opened ${targetKey}. ${startupReport}\n\n` +
           attachBlockText(
+            this.attachCommandLine,
             `Offer the human one-click eyes on this session: relay the attach ` +
               `command below verbatim, as its own bash-fenced code block — the ` +
               `app renders a Run button on it. Run in Claude Desktop's ` +
@@ -405,7 +411,7 @@ export class SessionManager {
       `Airlock never kills it automatically — it may be live, possibly with the human ` +
       `attached. Ask the human to end it (attach in the integrated terminal and exit ` +
       `the remote program), then open again. ` +
-      attachBlockText(`One-click attach for the human (bash-fenced, verbatim):`)
+      attachBlockText(this.attachCommandLine, `One-click attach for the human (bash-fenced, verbatim):`)
     );
   }
 

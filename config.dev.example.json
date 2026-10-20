@@ -1,0 +1,23 @@
+{
+  "ssh_config": "/dev/null",
+  "instructions": "This is a development instance of Airlock with local targets only: use it to exercise the bridge itself, never to reach a remote host. Every command is human-approved in a native overlay; a denial may carry feedback — adjust and resend.",
+  "targets": {
+    "local-shell": {
+      "description": "Local bash shell (development instance)",
+      "transport": "script",
+      "script": "/usr/bin/env",
+      "args": ["LANG=en_US.UTF-8", "/bin/bash", "--norc", "--noprofile"],
+      "display_command": "/usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile",
+      "driver": "shell"
+    },
+    "local-irb": {
+      "description": "Local IRB console (development instance)",
+      "transport": "script",
+      "script": "/usr/bin/env",
+      "args": ["LANG=en_US.UTF-8", "/bin/bash", "--norc", "--noprofile"],
+      "display_command": "/usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile\ncd /private/tmp\nirb --noautocomplete",
+      "startup": ["cd /private/tmp", "irb --noautocomplete"],
+      "driver": "rails_irb"
+    }
+  }
+}
