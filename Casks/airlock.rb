@@ -1,6 +1,6 @@
 cask "airlock" do
   version "1.0.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "88df7c5a6908f38741a402927767270e9f9b42cc6b9ad9ec7d8f639df441e64a"
 
   url "https://github.com/unabridged/airlock/releases/download/v#{version}/airlock-#{version}.pkg"
   name "Airlock"
