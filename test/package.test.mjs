@@ -365,33 +365,112 @@ function caskMacosLine(caskSource) {
   return caskSource.split("\n").find((line) => line.trim().startsWith("depends_on macos:"));
 }
 
-// Runs bin/bump-cask on `packagePath` against a copy of the repository's cask
-// and returns the result with the rewritten copy.
-function bumpCaskCopy(packagePath) {
-  const caskCopyPath = join(makeScratchDirectory(`cask-${Math.random().toString(36).slice(2)}`), "airlock.rb");
-  copyFileSync(CASK_PATH, caskCopyPath);
-  const result = spawnSync(BUMP_CASK_PATH, [packagePath, "--cask", caskCopyPath], { encoding: "utf8" });
-  return { result, caskSource: readFileSync(caskCopyPath, "utf8") };
+// The cask's version, which the install docs pin in their release links.
+const CASK_VERSION = readFileSync(CASK_PATH, "utf8").match(/^ {2}version "([^"]+)"$/m)[1];
+const RELEASE_DOCUMENTS = ["docs/install.md", "docs/agent-install.md", "docs/development.md"];
+
+// A package named for `version` whose Distribution allows macOS 14 and later.
+function makeReleasePackage(version) {
+  const packageDirectory = makeScratchDirectory(`bump-${Math.random().toString(36).slice(2)}`);
+  writeFileSync(
+    join(packageDirectory, "Distribution"),
+    '<installer-gui-script>\n    <allowed-os-versions>\n        <os-version min="14.0"/>\n' +
+      "    </allowed-os-versions>\n</installer-gui-script>\n",
+  );
+  const packagePath = join(packageDirectory, `airlock-${version}.pkg`);
+  execFileSync("/usr/bin/xar", ["-c", "-f", packagePath, "Distribution"], { cwd: packageDirectory });
+  return packagePath;
+}
+
+// A scratch repository root holding copies of the cask and the install docs.
+function makeBumpRoot() {
+  const bumpRoot = makeScratchDirectory(`bump-root-${Math.random().toString(36).slice(2)}`);
+  for (const relativePath of ["Casks/airlock.rb", ...RELEASE_DOCUMENTS]) {
+    mkdirSync(dirname(join(bumpRoot, relativePath)), { recursive: true });
+    copyFileSync(join(REPO_ROOT, relativePath), join(bumpRoot, relativePath));
+  }
+  return bumpRoot;
+}
+
+function readBumpRoot(bumpRoot, relativePath) {
+  return readFileSync(join(bumpRoot, relativePath), "utf8");
+}
+
+function runBumpCask(packagePath, bumpRoot) {
+  return spawnSync(BUMP_CASK_PATH, [packagePath, "--root", bumpRoot], { encoding: "utf8" });
 }
 
 describe("bin/bump-cask", () => {
   it("rewrites the version, sha256, and macOS minimum from the package", () => {
-    const packageDirectory = makeScratchDirectory(`bump-${Math.random().toString(36).slice(2)}`);
-    writeFileSync(
-      join(packageDirectory, "Distribution"),
-      '<installer-gui-script>\n    <allowed-os-versions>\n        <os-version min="14.0"/>\n' +
-        "    </allowed-os-versions>\n</installer-gui-script>\n",
-    );
-    const packagePath = join(packageDirectory, "airlock-1.2.3.pkg");
-    execFileSync("/usr/bin/xar", ["-c", "-f", packagePath, "Distribution"], { cwd: packageDirectory });
+    const packagePath = makeReleasePackage("1.2.3");
     const packageSha256 = execFileSync("/usr/bin/shasum", ["-a", "256", packagePath], { encoding: "utf8" })
       .split(" ")[0];
+    const bumpRoot = makeBumpRoot();
 
-    const { result, caskSource } = bumpCaskCopy(packagePath);
+    const result = runBumpCask(packagePath, bumpRoot);
     assert.equal(result.status, 0, result.stderr);
+    const caskSource = readBumpRoot(bumpRoot, "Casks/airlock.rb");
     assert.match(caskSource, /^ {2}version "1\.2\.3"$/m);
     assert.ok(caskSource.includes(`\n  sha256 "${packageSha256}"\n`), caskSource);
     assert.equal(caskMacosLine(caskSource), "  depends_on macos: :sonoma");
+  });
+
+  it("moves the install docs' release links from the cask's version to the package's", () => {
+    const nextVersion = `${Number(CASK_VERSION.split(".")[0]) + 1}.0.0`;
+    const bumpRoot = makeBumpRoot();
+
+    const result = runBumpCask(makeReleasePackage(nextVersion), bumpRoot);
+    assert.equal(result.status, 0, result.stderr);
+    for (const relativePath of RELEASE_DOCUMENTS) {
+      const original = readFileSync(join(REPO_ROOT, relativePath), "utf8");
+      const expected = original
+        .replaceAll(`v${CASK_VERSION}`, `v${nextVersion}`)
+        .replaceAll(`airlock-${CASK_VERSION}`, `airlock-${nextVersion}`);
+      assert.notEqual(expected, original, `${relativePath} names no release ${CASK_VERSION}`);
+      assert.equal(readBumpRoot(bumpRoot, relativePath), expected, relativePath);
+    }
+    assert.ok(
+      readBumpRoot(bumpRoot, "docs/install.md").includes(
+        `releases/download/v${nextVersion}/airlock-${nextVersion}.pkg`,
+      ),
+    );
+  });
+
+  it("changes nothing when a doc pins another version than the cask's", () => {
+    const bumpRoot = makeBumpRoot();
+    const agentInstallPath = join(bumpRoot, "docs/agent-install.md");
+    writeFileSync(agentInstallPath, readFileSync(agentInstallPath, "utf8").replaceAll(CASK_VERSION, "0.0.1"));
+
+    const result = runBumpCask(makeReleasePackage("1.2.3"), bumpRoot);
+    assert.equal(result.status, 1);
+    assert.ok(
+      result.stderr.includes(`docs/agent-install.md names releases "0.0.1", expected only the cask's ${CASK_VERSION}`),
+      result.stderr,
+    );
+    assert.equal(readBumpRoot(bumpRoot, "Casks/airlock.rb"), readFileSync(CASK_PATH, "utf8"));
+    for (const relativePath of RELEASE_DOCUMENTS.filter((path) => path !== "docs/agent-install.md")) {
+      assert.equal(readBumpRoot(bumpRoot, relativePath), readFileSync(join(REPO_ROOT, relativePath), "utf8"));
+    }
+  });
+
+  it("changes nothing when one of a doc's release references drifts from the cask's version", () => {
+    const bumpRoot = makeBumpRoot();
+    const installPath = join(bumpRoot, "docs/install.md");
+    const installSource = readFileSync(installPath, "utf8");
+    writeFileSync(
+      installPath,
+      installSource.replace(`sudo installer -pkg airlock-${CASK_VERSION}.pkg`, "sudo installer -pkg airlock-0.0.1.pkg"),
+    );
+
+    const result = runBumpCask(makeReleasePackage("1.2.3"), bumpRoot);
+    assert.equal(result.status, 1);
+    assert.ok(
+      result.stderr.includes(`docs/install.md names releases "0.0.1 ${CASK_VERSION}", expected only the cask's`),
+      result.stderr,
+    );
+    assert.equal(readBumpRoot(bumpRoot, "Casks/airlock.rb"), readFileSync(CASK_PATH, "utf8"));
+    assert.notEqual(readBumpRoot(bumpRoot, "docs/install.md"), installSource);
+    assert.ok(readBumpRoot(bumpRoot, "docs/install.md").includes(`releases/download/v${CASK_VERSION}/`));
   });
 });
 

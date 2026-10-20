@@ -1,19 +1,25 @@
 #!/bin/bash
-# Airlock — points the Homebrew cask at a released package.
+# Airlock — points the Homebrew cask and the install docs at a released
+# package.
 #
-#   bin/bump-cask dist/airlock-X.Y.Z.pkg [--cask PATH]
+#   bin/bump-cask dist/airlock-X.Y.Z.pkg [--root DIR]
 #
 # Reads the version from the package file name, its sha256 from the file
 # itself, and its minimum macOS from its Distribution, then rewrites the
-# version, sha256, and `depends_on macos:` lines of Casks/airlock.rb (or the
-# cask at PATH) in place. Run it on the exact file attached to the GitHub
-# release, since the cask's sha256 must match what Homebrew downloads.
+# version, sha256, and `depends_on macos:` lines of Casks/airlock.rb in place.
+# The install docs pin the cask's release in their download links and tags,
+# and it moves those to the new version too, refusing to change anything
+# unless every one names the cask's current version. DIR is the repository root
+# holding both (this checkout by default). Run it on the exact file attached
+# to the GitHub release, since the cask's sha256 must match what Homebrew
+# downloads.
 set -euo pipefail
 
 REPOSITORY_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 VERSION_LINE='^([[:space:]]*)version "[^"]*"[[:space:]]*$'
 SHA256_LINE='^([[:space:]]*)sha256 ("[0-9a-f]*"|:no_check)[[:space:]]*$'
 MACOS_LINE='^([[:space:]]*)depends_on macos: [^[:space:]]+[[:space:]]*$'
+RELEASE_DOCUMENTS=(docs/install.md docs/agent-install.md docs/development.md)
 
 fail() {
   printf 'bump-cask: %s\n' "$*" >&2
@@ -21,7 +27,7 @@ fail() {
 }
 
 usage() {
-  printf 'usage: bin/bump-cask <airlock-X.Y.Z.pkg> [--cask PATH]\n'
+  printf 'usage: bin/bump-cask <airlock-X.Y.Z.pkg> [--root DIR]\n'
 }
 
 # Fails unless exactly one line of the cask matches the pattern.
@@ -30,6 +36,20 @@ require_single_line() {
   match_count=$(grep -cE -- "$line_pattern" "$cask_path" || true)
   [[ $match_count == 1 ]] ||
     fail "$cask_path has $match_count $line_description lines, expected exactly one."
+}
+
+# Prints an extended regular expression matching a whole-word release
+# reference, such as `v1.0.0` or the `airlock-1.0.0` of a package name, whose
+# version matches the given pattern, with its prefix in the first group.
+release_reference_pattern() {
+  printf '[[:<:]](v|airlock-)%s[[:>:]]\n' "$1"
+}
+
+# Prints the distinct versions the document's release references name, on one
+# line.
+document_release_versions() {
+  { grep -oE -- "$(release_reference_pattern '[0-9]+\.[0-9]+\.[0-9]+')" "$1" || true; } |
+    sed -E 's/^(v|airlock-)//' | sort -u | paste -sd ' ' -
 }
 
 # Prints the Homebrew symbol for a macOS major version.
@@ -61,12 +81,12 @@ read_package_minimum_macos() {
 }
 
 package_path=""
-cask_path="$REPOSITORY_ROOT/Casks/airlock.rb"
+target_root=$REPOSITORY_ROOT
 while (($#)); do
   case $1 in
-    --cask)
+    --root)
       (($# >= 2)) || { usage >&2; exit 2; }
-      cask_path=$2
+      target_root=$2
       shift 2
       ;;
     -h | --help)
@@ -86,6 +106,7 @@ while (($#)); do
 done
 [[ -n $package_path ]] || { usage >&2; exit 2; }
 
+cask_path="$target_root/Casks/airlock.rb"
 [[ -f $package_path ]] || fail "$package_path not found."
 [[ -f $cask_path ]] || fail "$cask_path not found."
 package_file_name=$(basename -- "$package_path")
@@ -101,11 +122,29 @@ require_single_line "$VERSION_LINE" version
 require_single_line "$SHA256_LINE" sha256
 require_single_line "$MACOS_LINE" "depends_on macos"
 
+cask_version=$(sed -n -E 's/^[[:space:]]*version "([^"]*)"[[:space:]]*$/\1/p' "$cask_path")
+[[ $cask_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  fail "$cask_path has version \"$cask_version\", expected X.Y.Z."
+cask_release_reference=$(release_reference_pattern "${cask_version//./\\.}")
+for release_document in "${RELEASE_DOCUMENTS[@]}"; do
+  [[ -f $target_root/$release_document ]] || fail "$target_root/$release_document not found."
+  document_versions=$(document_release_versions "$target_root/$release_document")
+  [[ $document_versions == "$cask_version" ]] ||
+    fail "$release_document names releases \"$document_versions\", expected only the cask's $cask_version."
+done
+
 sed -E -i '' \
   -e "s/$VERSION_LINE/\\1version \"$package_version\"/" \
   -e "s/$SHA256_LINE/\\1sha256 \"$package_sha256\"/" \
   -e "s/$MACOS_LINE/\\1depends_on macos: :$macos_symbol/" \
   "$cask_path"
 
+for release_document in "${RELEASE_DOCUMENTS[@]}"; do
+  sed -E -i '' -e "s/$cask_release_reference/\\1$package_version/g" \
+    "$target_root/$release_document"
+done
+
 printf 'Updated %s to version %s, sha256 %s, macOS %s (:%s)\n' "$cask_path" "$package_version" \
   "$package_sha256" "$package_minimum_macos" "$macos_symbol"
+printf 'Moved the release links in %s from %s to %s\n' "${RELEASE_DOCUMENTS[*]}" "$cask_version" \
+  "$package_version"

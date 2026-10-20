@@ -107,7 +107,8 @@ and `src/install-check.mjs`. Against the proposed fix:
    configuration, Node, tmux, and the helper. `~/.config/airlock/` is no
    longer read, and colorization runs in-process (Shiki, from the install's
    `node_modules`) instead of through Ruby. The state directory still needs
-   sandbox rules, which the README lists.
+   sandbox rules, which the
+   [manual install](docs/install.md#block-the-direct-path) lists.
 3. The checkout cannot run as the production server: it fails the install
    check, and `bin/airlock-server` refuses to run without the bundled Node. The
    package is the separately installed immutable copy. A checkout runs only as
