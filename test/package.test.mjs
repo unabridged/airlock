@@ -7,7 +7,8 @@
 // of the working tree to a temporary git repository, build a release .pkg
 // there with bin/build-pkg, expand it with pkgutil, and check the payload the
 // installer would lay down under /usr/local/libexec/airlock, and they check
-// the builds bin/build-pkg refuses. No test ever installs the package.
+// the builds bin/build-pkg refuses or warns about. No test ever installs the
+// package.
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -658,6 +659,8 @@ describe("bin/build-pkg refusals", PACKAGE_SUITE_OPTIONS, () => {
     return build;
   }
 
+  // Commits a changed packaging/runtime.lock and tags that commit as the
+  // release, so a `--tag` build reaches the lock check.
   function rewriteRuntimeLock(repositoryPath, rewriteEntry) {
     const lockPath = join(repositoryPath, "packaging", "runtime.lock");
     const lines = readFileSync(lockPath, "utf8").split("\n");
@@ -666,6 +669,13 @@ describe("bin/build-pkg refusals", PACKAGE_SUITE_OPTIONS, () => {
     );
     writeFileSync(lockPath, rewritten.join("\n"));
     commitAll(repositoryPath, "Change the runtime lock");
+    git(repositoryPath, "tag", releaseTag);
+  }
+
+  function zeroTmuxChecksum(repositoryPath) {
+    rewriteRuntimeLock(repositoryPath, ([formula, version, kegPath, sha256]) => [
+      [formula, version, kegPath, kegPath === "bin/tmux" ? "0".repeat(64) : sha256].join(" "),
+    ]);
   }
 
   it("refuses a working tree with uncommitted changes", () => {
@@ -703,29 +713,41 @@ describe("bin/build-pkg refusals", PACKAGE_SUITE_OPTIONS, () => {
     assert.match(build.stderr, /package\.json's version is \d+\.\d+\.\d+, but the tag is v99\.0\.0/);
   });
 
-  it("refuses a bundled Homebrew file whose checksum differs from runtime.lock", () => {
-    const build = buildAfter((repositoryPath) =>
-      rewriteRuntimeLock(repositoryPath, ([formula, version, kegPath, sha256]) => [
-        [formula, version, kegPath, kegPath === "bin/tmux" ? "0".repeat(64) : sha256].join(" "),
-      ]),
-    );
-    assert.match(build.stderr, /do not match packaging\/runtime\.lock/);
+  it("refuses a release whose bundled Homebrew file differs from runtime.lock", () => {
+    const build = buildAfter(zeroTmuxChecksum, ["--tag", releaseTag]);
+    assert.match(build.stderr, /^build-pkg: the Homebrew files bundled from this machine do not match packaging\/runtime\.lock\.$/m);
     assert.match(build.stderr, /^ {4}bundled, not pinned: tmux \S+ bin\/tmux [0-9a-f]{64}$/m);
     assert.match(build.stderr, /^ {4}pinned, not bundled: tmux \S+ bin\/tmux 0{64}$/m);
+  });
+
+  it("builds a development package whose bundled Homebrew file differs from runtime.lock, with a warning", () => {
+    const repositoryPath = makeBuildRepository("development-mismatch");
+    zeroTmuxChecksum(repositoryPath);
+    const outputDirectory = makeScratchDirectory("development-mismatch-dist");
+    const build = runBuild(repositoryPath, ["--output", outputDirectory]);
+    assert.equal(build.status, 0, `exit ${build.status} ${build.signal}:\n${build.stdout}\n${build.stderr}`);
+    assert.match(
+      build.stderr,
+      /^build-pkg: warning: the Homebrew files bundled from this machine do not match packaging\/runtime\.lock, which a release build \(--tag\) refuses\.$/m,
+    );
+    assert.match(build.stderr, /^ {4}pinned, not bundled: tmux \S+ bin\/tmux 0{64}$/m);
+    assert.match(readdirSync(outputDirectory).join(), /^airlock-\d+\.\d+\.\d+-dev-[0-9a-f]{12}\.pkg$/);
   });
 
   for (const [description, isRemovedEntry] of [
     ["library", ([, , kegPath]) => kegPath.startsWith("lib/")],
     ["license file", ([formula, , kegPath]) => formula === "tmux" && kegPath === "COPYING"],
   ]) {
-    it(`refuses a bundled Homebrew ${description} that runtime.lock does not pin`, () => {
+    it(`refuses a release with a bundled Homebrew ${description} that runtime.lock does not pin`, () => {
       let removedEntry;
-      const build = buildAfter((repositoryPath) =>
-        rewriteRuntimeLock(repositoryPath, (entry) => {
-          if (removedEntry || !isRemovedEntry(entry)) return [entry.join(" ")];
-          removedEntry = entry.join(" ");
-          return [];
-        }),
+      const build = buildAfter(
+        (repositoryPath) =>
+          rewriteRuntimeLock(repositoryPath, (entry) => {
+            if (removedEntry || !isRemovedEntry(entry)) return [entry.join(" ")];
+            removedEntry = entry.join(" ");
+            return [];
+          }),
+        ["--tag", releaseTag],
       );
       assert.ok(removedEntry, `packaging/runtime.lock pins no ${description}`);
       assert.ok(
