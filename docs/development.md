@@ -2,17 +2,12 @@
 
 ## Install from source
 
-Build the package from a checkout of a release tag (see
+Build the package from a release tag (see
 [Building the package](#building-the-package) for what the build needs), then
-install it the same way as a release. Clone the repository and check out the
-release, replacing `X.Y.Z` with its version:
+install it the same way as a release:
 
 ```bash
-git clone https://github.com/unabridged/airlock.git && cd airlock
-```
-
-```bash
-git checkout vX.Y.Z
+git clone --branch v1.0.0 https://github.com/unabridged/airlock.git && cd airlock
 ```
 
 ```bash
@@ -20,7 +15,7 @@ bin/build-pkg
 ```
 
 ```bash
-sudo installer -pkg dist/airlock-X.Y.Z-dev-<commit>.pkg -target /
+sudo installer -pkg dist/airlock-*.pkg -target /
 ```
 
 The package bundles your Homebrew tmux. When its files differ from the ones
@@ -189,10 +184,14 @@ npm run test:package
    ```
 
    It also copies the package's minimum macOS into the cask's
-   `depends_on macos:` line.
+   `depends_on macos:` line, and moves the release links and tags in the
+   [manual install](install.md), the [agent install](agent-install.md), and
+   [Install from source](#install-from-source) to the new version. It refuses
+   to change anything unless every release link and tag in those docs names
+   the cask's current version.
 
-6. Commit and push `Casks/airlock.rb`. The tap reads the cask from the
-   default branch.
+6. Commit and push `Casks/airlock.rb` and the docs. The tap reads the cask,
+   and the agent install its instructions, from the default branch.
 
 ## Layout
 

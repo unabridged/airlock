@@ -39,24 +39,17 @@ Then hand the person the install, which asks for their password:
 brew install --cask unabridged/airlock/airlock
 ```
 
-**Without Homebrew:** find the latest release, whose tag ends the printed URL
-(such as `.../releases/tag/v1.0.0`):
+**Without Homebrew:** download the release package into a new, empty directory,
+which prints the package's path:
 
 ```bash
-curl -fsSL -o /dev/null -w '%{url_effective}\n' https://github.com/unabridged/airlock/releases/latest
-```
-
-Download its package into a new, empty directory, replacing `X.Y.Z` with the
-tag's version, and print the package's path:
-
-```bash
-download_dir="$(mktemp -d)" && curl -fL -o "$download_dir/airlock-X.Y.Z.pkg" https://github.com/unabridged/airlock/releases/download/vX.Y.Z/airlock-X.Y.Z.pkg && ls "$download_dir"/*.pkg
+download_dir="$(mktemp -d)" && curl -fL -o "$download_dir/airlock-1.0.0.pkg" https://github.com/unabridged/airlock/releases/download/v1.0.0/airlock-1.0.0.pkg && ls "$download_dir/airlock-1.0.0.pkg"
 ```
 
 Then hand the person the install command with that path:
 
 ```bash
-sudo installer -pkg /path/to/airlock-X.Y.Z.pkg -target /
+sudo installer -pkg /path/to/airlock-1.0.0.pkg -target /
 ```
 
 Afterwards, confirm `/usr/local/libexec/airlock/bin/airlock-server` exists.

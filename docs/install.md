@@ -35,16 +35,14 @@ brew install --cask unabridged/airlock/airlock
 
 ### Direct package
 
-Download the package from the
-[latest release](https://github.com/unabridged/airlock/releases/latest) and
-install it, replacing `X.Y.Z` with the release version:
+Download the release package and install it:
 
 ```bash
-curl -fLO https://github.com/unabridged/airlock/releases/download/vX.Y.Z/airlock-X.Y.Z.pkg
+curl -fLO https://github.com/unabridged/airlock/releases/download/v1.0.0/airlock-1.0.0.pkg
 ```
 
 ```bash
-sudo installer -pkg airlock-X.Y.Z.pkg -target /
+sudo installer -pkg airlock-1.0.0.pkg -target /
 ```
 
 The installer installs only on the startup volume. It changes nothing when
@@ -270,9 +268,11 @@ To upgrade, run `brew upgrade --cask airlock`, or install the newer release's
 brew upgrade --cask airlock
 ```
 
-To roll back, install the older release's direct package. The cask always
-points at the latest release, so a Homebrew install rolls back through the
-direct package too.
+To roll back, download the older release's package from the
+[releases page](https://github.com/unabridged/airlock/releases) and install it
+with `sudo installer` as under [Direct package](#direct-package). The cask
+always points at the latest release, so a Homebrew install rolls back through
+the direct package too.
 
 To uninstall with Homebrew, which keeps `config.json`:
 
