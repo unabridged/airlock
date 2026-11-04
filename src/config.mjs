@@ -29,6 +29,36 @@ const DEFAULTS = {
   output_max_bytes: 65536,
 };
 
+// The config is the bridge's first read, so its failure is the first thing a
+// person sees, and the two failures want opposite advice. A path with nothing
+// at it wants "create it". A path that is there but cannot be opened — a
+// permission bit, a sandbox policy, a directory in its place — wants "fix the
+// access"; telling someone to create a file that already exists sends them
+// looking in the wrong place.
+const MISSING_CONFIG_CODES = new Set(["ENOENT", "ENOTDIR"]);
+const UNREADABLE_CONFIG_CODES = new Set(["EACCES", "EPERM"]);
+
+function configOpenError(configPath, err) {
+  const code = err?.code;
+  if (MISSING_CONFIG_CODES.has(code)) {
+    return new Error(
+      `Airlock config not readable at ${configPath}: ${err.message}. ` +
+        `Create it (see config.example.json in the airlock repo) — the bridge never falls back to the example.`,
+    );
+  }
+  if (UNREADABLE_CONFIG_CODES.has(code)) {
+    return new Error(
+      `Airlock config at ${configPath} exists but cannot be opened: ${err.message}. ` +
+        `Check that it is a readable file, and — when the server runs under a sandbox — that the sandbox allows reading it. ` +
+        `The bridge never falls back to the example.`,
+    );
+  }
+  return new Error(
+    `Airlock config at ${configPath} could not be opened: ${err.message}. ` +
+      `The bridge never falls back to the example.`,
+  );
+}
+
 export function loadConfig(configPath) {
   if (typeof configPath !== "string" || configPath === "") {
     throw new TypeError("loadConfig requires the config file's path");
@@ -37,10 +67,7 @@ export function loadConfig(configPath) {
   try {
     rawContent = readFileSync(configPath, "utf8");
   } catch (err) {
-    throw new Error(
-      `Airlock config not readable at ${configPath}: ${err.message}. ` +
-        `Create it (see config.example.json in the airlock repo) — the bridge never falls back to the example.`,
-    );
+    throw configOpenError(configPath, err);
   }
 
   let parsed;

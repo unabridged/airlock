@@ -2,7 +2,7 @@
 // Zero-dependency: node:test + node:assert only.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -110,6 +110,41 @@ describe("loadConfig — errors name the config path and the problem", () => {
       (err) =>
         err.message.includes(missingPath) && err.message.includes("never falls back to the example"),
     );
+  });
+
+  it("does not tell you to create a config that exists but cannot be opened", () => {
+    // A directory where the file should be: the path resolves, the open fails,
+    // and "Create it" would be the wrong advice.
+    const directoryPath = join(scratch, "config-as-directory");
+    mkdirSync(directoryPath, { recursive: true });
+    assert.throws(
+      () => loadConfig(directoryPath),
+      (err) =>
+        err.message.includes(directoryPath) &&
+        err.message.includes("could not be opened") &&
+        !err.message.includes("Create it") &&
+        err.message.includes("never falls back to the example"),
+    );
+  });
+
+  it("names a denied read as an access problem, not a missing file", (t) => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      t.skip("root reads a 0o000 file");
+      return;
+    }
+    const deniedPath = writeFile("denied.json", "{}");
+    chmodSync(deniedPath, 0o000);
+    try {
+      assert.throws(
+        () => loadConfig(deniedPath),
+        (err) =>
+          err.message.includes(deniedPath) &&
+          err.message.includes("exists but cannot be opened") &&
+          !err.message.includes("Create it"),
+      );
+    } finally {
+      chmodSync(deniedPath, 0o600);
+    }
   });
 
   it("errors on invalid JSON, naming the path", () => {
