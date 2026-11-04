@@ -22,29 +22,42 @@ const EXCERPT_LENGTH = 60;
 // The Claude-facing statement of the contract. The send_terminal tool
 // description and the initialize instructions are generated from it, so the
 // guidance the model reads and the rules the bridge enforces cannot drift.
-export const CONTRACT_SPEC_TEXT = [
-  "Style contract for the command text (the overlay shows it verbatim at " +
-    `${COMMAND_COLUMNS} columns; commands that break the contract are rejected ` +
-    "before the human sees them):",
+//
+// Both drivers are named because the text goes out once, before any target is
+// open: `=` spacing is Ruby's spelling and a syntax error in a shell, and a
+// shell's quoting rules are noise in irb. Grouped by driver, so a model that
+// has opened one target is not taught the other's grammar as a general rule.
+const SHARED_CONTRACT_RULES = [
   `- at most ${COMMAND_COLUMNS} columns per line and ${MAX_COMMAND_LINES} lines ` +
     "per send; split a longer script into several sends (console state " +
     "persists between sends)",
   "- one statement per line: never join statements with `;`",
   "- no comment lines; the code reads on its own through its names",
-  "- full-word variable names (`order`, not `o`, `tmp`, or `res`)",
+  "- one blank line between sections, and each section ends in a labeled print",
+  "- plain ASCII outside string contents: no tabs, control characters, " +
+    "zero-width or bidi characters, or non-ASCII spaces",
+];
+
+const RAILS_CONTRACT_RULES = [
   "- spaces around `=` and after every comma",
-  "- one blank line between sections, and each section ends in a labeled " +
-    'print such as `puts "label: #{value}"` (a multi-statement console paste ' +
-    "prints only its final value)",
+  "- full-word variable names (`order`, not `o`, `tmp`, or `res`)",
   "- arrays fill-wrapped: several elements per line, up to " +
     `${COMMAND_COLUMNS} columns, never one element per line`,
   "- one leading-dot chained call per line",
-  "- shell: wrap a long line with a trailing backslash, but prefer one-line " +
-    "control flow (`for f in *.log; do wc -l $f; done`) because each " +
-    "continuation line costs about a second",
-  "- plain ASCII outside string contents: no tabs, control characters, " +
-    "zero-width or bidi characters, or non-ASCII spaces",
-  "Example (12 lines):",
+  "- a section's labeled print is `puts` (a multi-statement console paste " +
+    "prints only its final value)",
+];
+
+const SHELL_CONTRACT_RULES = [
+  "- no spaces around `=` in an assignment: `name=value`. `name = value` asks " +
+    "bash for a command called `name`, so the value silently comes back empty",
+  '- quote expansions that may be empty or contain spaces: `"$path"`, `"$@"`',
+  "- prefer one-line control flow (`for f in *.log; do wc -l $f; done`); each " +
+    "backslash continuation costs about a second",
+  "- a section's labeled print is `printf 'label: %s\\n' \"$value\"`",
+];
+
+const RAILS_EXAMPLE = [
   "user = User.find(1234)",
   "orders = user.orders.includes(:line_items, :payments).to_a",
   'puts "orders: #{orders.size}"',
@@ -57,11 +70,42 @@ export const CONTRACT_SPEC_TEXT = [
   "late_order_ids = [10001, 10002, 10003, 10004, 10005, 10006, 10007]",
   'late_orders = Order.where(id: late_order_ids, status: "late").count',
   'puts "late orders: #{late_orders}"',
+];
+
+const SHELL_EXAMPLE = [
+  "logs=0",
+  "for file in *.log; do logs=$((logs + 1)); done",
+  'printf \'logs: %s\\n\' "$logs"',
+  "",
+  'session="/tmp/airlock-demo"',
+  'printf \'session: %s\\n\' "$session"',
+];
+
+// The worked examples alone, for the tests that prove the spec's own examples
+// pass the contract they illustrate.
+export const CONTRACT_EXAMPLES = {
+  rails_irb: RAILS_EXAMPLE.join("\n"),
+  shell: SHELL_EXAMPLE.join("\n"),
+};
+
+export const CONTRACT_SPEC_TEXT = [
+  "Style contract for the command text (the overlay shows it verbatim at " +
+    `${COMMAND_COLUMNS} columns; commands that break the contract are rejected ` +
+    "before the human sees them):",
+  ...SHARED_CONTRACT_RULES,
+  "",
+  "rails_irb (Ruby):",
+  ...RAILS_CONTRACT_RULES,
+  `Example (${RAILS_EXAMPLE.length} lines):`,
+  ...RAILS_EXAMPLE,
+  "",
+  "shell (bash):",
+  ...SHELL_CONTRACT_RULES,
+  `Example (${SHELL_EXAMPLE.length} lines):`,
+  ...SHELL_EXAMPLE,
 ].join("\n");
 
-// The worked example alone, for the tests that prove the spec's own example
-// passes the contract it illustrates.
-export const CONTRACT_EXAMPLE_COMMAND = CONTRACT_SPEC_TEXT.split("Example (12 lines):\n")[1];
+export const CONTRACT_EXAMPLE_COMMAND = CONTRACT_EXAMPLES.rails_irb;
 
 const SHORT_NAME_ALLOWLIST = new Set(["id"]);
 const GENERIC_NAMES = new Set([
