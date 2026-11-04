@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import {
   checkCommandContract,
   COMMAND_COLUMNS,
+  CONTRACT_EXAMPLES,
   CONTRACT_EXAMPLE_COMMAND,
   CONTRACT_SPEC_TEXT,
   formatContractViolations,
@@ -403,6 +404,22 @@ describe("the dense command and its rewrite", () => {
     assert.match(CONTRACT_SPEC_TEXT, /Example \(12 lines\):/);
     assert.equal(CONTRACT_EXAMPLE_COMMAND.split("\n").length, 12);
     assertPasses(checkRuby(CONTRACT_EXAMPLE_COMMAND));
+  });
+
+  it("shows a shell example that passes for a shell, and the Ruby one does not", () => {
+    assert.match(CONTRACT_SPEC_TEXT, /Example \(6 lines\):/);
+    assertPasses(checkShell(CONTRACT_EXAMPLES.shell));
+    // The same text is not Ruby: `logs=0` has no space around `=`.
+    assertRejects(checkRuby(CONTRACT_EXAMPLES.shell), "spacing");
+  });
+
+  it("keeps Ruby's `=` spacing under the rails_irb heading, not in the shared rules", () => {
+    const [shared, rails, shell] = CONTRACT_SPEC_TEXT.split(/\n(?:rails_irb \(Ruby\)|shell \(bash\)):\n/);
+    assert.ok(shared && rails && shell, "the spec names both drivers");
+    assert.ok(!shared.includes("- spaces around `=`"), "the `=` rule is not shared");
+    assert.ok(rails.includes("- spaces around `=`"), "rails_irb keeps its `=` spacing");
+    assert.ok(!shell.includes("- spaces around `=`"), "a shell is not told to space `=`");
+    assert.match(shell, /no spaces around `=` in an assignment/);
   });
 });
 
