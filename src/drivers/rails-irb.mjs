@@ -170,24 +170,29 @@ export function createRailsIrbDriver({ startupCommands = [] } = {}) {
     // password field, never into a still-rendered pre-injection pane) → the
     // console command must settle on an IRB-sigil line, which is adopted as
     // the prompt and verified by the pager-disable round-trip.
-    async start({ tmux, timeouts, outputCap }) {
+    async start({ tmux, timeouts, outputCap, adopt = false }) {
       await waitForQuiescence({ tmux, timeoutMs: timeouts.openMs });
-      const preludeCommands = startupCommands.slice(0, -1);
-      const consoleCommand = startupCommands[startupCommands.length - 1];
-      for (const startupCommand of preludeCommands) {
-        const lineBoundary = await markOutputBoundary(tmux);
-        await pasteCommand(tmux, startupCommand);
-        await waitForQuiescence({
-          tmux,
-          timeoutMs: timeouts.openMs,
-          quietMs: 700,
-          boundaryLineCount: lineBoundary,
-        });
-      }
       let consoleBoundary;
-      if (consoleCommand !== undefined) {
-        consoleBoundary = await markOutputBoundary(tmux);
-        await pasteCommand(tmux, consoleCommand);
+      // An adopt takes the console that is already running: its startup lines
+      // ran in the session being taken over, and sending them again would
+      // nest a second console inside the first.
+      if (!adopt) {
+        const preludeCommands = startupCommands.slice(0, -1);
+        const consoleCommand = startupCommands[startupCommands.length - 1];
+        for (const startupCommand of preludeCommands) {
+          const lineBoundary = await markOutputBoundary(tmux);
+          await pasteCommand(tmux, startupCommand);
+          await waitForQuiescence({
+            tmux,
+            timeoutMs: timeouts.openMs,
+            quietMs: 700,
+            boundaryLineCount: lineBoundary,
+          });
+        }
+        if (consoleCommand !== undefined) {
+          consoleBoundary = await markOutputBoundary(tmux);
+          await pasteCommand(tmux, consoleCommand);
+        }
       }
       // A loading console sits quiet for seconds mid-banner ("Loading
       // staging environment…" with the cursor at line end), so plain
@@ -202,6 +207,15 @@ export function createRailsIrbDriver({ startupCommands = [] } = {}) {
       });
       promptLine = settledSnapshot.lastLine;
       promptPatterns = buildIrbPromptPatterns(promptLine);
+      if (adopt) {
+        // Nothing is sent on an adopt, so the pager-disable round-trip that
+        // normally proves this is IRB is skipped: the console that is here
+        // already ran it (or did not) when it was first opened.
+        return (
+          `Rails console adopted (detected prompt: ${JSON.stringify(promptLine)}; ` +
+          `the pager state is whatever the previous session left).`
+        );
+      }
       const pagerReport = await runAtPrompt({
         tmux,
         command: DISABLE_PAGER_COMMAND,

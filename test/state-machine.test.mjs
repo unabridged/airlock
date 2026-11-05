@@ -610,6 +610,60 @@ describe("SessionManager — open handshake (beginOpen/commitOpen/abortOpen)", (
   });
 });
 
+describe("SessionManager — adopt a leftover session", () => {
+  let stateDirectory;
+  beforeEach(() => {
+    stateDirectory = mkdtempSync(join(scratch, "adopt-"));
+  });
+
+  // A pane an earlier bridge left behind: alive, at a prompt, no bridge.
+  function leftoverTmux() {
+    const tmux = new FakeShellTmux();
+    tmux.alive = true;
+    tmux.historyLines = [PROMPT];
+    return tmux;
+  }
+
+  it("takes over the pane that is there without creating or sending anything", async () => {
+    const tmux = leftoverTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    sessionManager.noteClient({ name: "pi", version: "1.4.0" });
+    const report = await sessionManager.open("fake-shell", { adopt: true });
+    assert.match(report, /^Adopted fake-shell\./);
+    assert.equal(tmux.launchArgv, null, "adopt never creates a session");
+    assert.deepEqual(tmux.historyLines, [PROMPT], "adopt sends nothing");
+    assert.equal(sessionManager.activeTargetKey, "fake-shell");
+    const state = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
+    assert.equal(state.adopted, true);
+    assert.deepEqual(state.client, { name: "pi", version: "1.4.0" });
+  });
+
+  it("refuses to adopt when there is no session running", async () => {
+    const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
+    await assert.rejects(sessionManager.open("fake-shell", { adopt: true }), /no session to adopt/i);
+  });
+
+  it("leaves the pane alone when an adoption fails", async () => {
+    const tmux = leftoverTmux();
+    tmux.capturePane = async () => {
+      throw new Error("pane probe failed");
+    };
+    let killed = false;
+    tmux.killSession = async () => {
+      killed = true;
+    };
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    const failure = await sessionManager.open("fake-shell", { adopt: true }).then(
+      () => assert.fail("adopt must surface the failed probe"),
+      (err) => err,
+    );
+    assert.match(failure.message, /adoption failed/);
+    assert.match(failure.message, /left untouched/);
+    assert.equal(killed, false, "an adopted pane is never reaped");
+    assert.equal(sessionManager.activeTargetKey, null);
+  });
+});
+
 // Liveness handling: a failed probe is not a dead session, and teardown never
 // races an in-flight operation.
 describe("SessionManager — liveness probes and teardown safety", () => {
