@@ -180,6 +180,16 @@ function buildTools() {
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
+      name: "clear_terminal",
+      description:
+        "End the session an earlier Airlock bridge left running, when the human has said " +
+        "it is dead and may be discarded. Requires human approval in the native overlay: " +
+        "Airlock never ends a running session on its own. Use close_terminal for the " +
+        "session you have open, and open_terminal with adopt: true to take the leftover " +
+        "over instead.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    },
+    {
       name: "list_targets",
       description:
         "List the configured Airlock targets (key, description, transport, SSH host or " +
@@ -424,6 +434,41 @@ async function handleCloseTerminal(id) {
   textResult(id, report);
 }
 
+// Gated, unlike close_terminal: closing only ever ends the session this bridge
+// owns, while a clear destroys a pane nobody in this session is holding — it
+// may be live, and may have a human attached. The pre-check runs before the
+// overlay so the human is never asked to approve a clear with nothing to
+// clear; {SessionManager#clearLeftover} re-checks inside the cross-bridge lock.
+async function handleClearTerminal(id) {
+  if (sessionManager.activeTargetKey) {
+    textResult(
+      id,
+      `This session has ${sessionManager.activeTargetKey} open. close_terminal ends the ` +
+        `session you have open; clear_terminal is for one an earlier bridge left behind.`,
+      { isError: true },
+    );
+    return;
+  }
+  try {
+    await sessionManager.assertLeftoverSession("clear");
+  } catch (err) {
+    if (!isExpectedSessionError(err)) throw err;
+    textResult(id, err.message, { isError: true });
+    return;
+  }
+  const approval = await approveOrExplain({
+    command: "(end the leftover session — its pane and remote connection are terminated)",
+    badge: "leftover · clear",
+    actionDescription: "End the session an earlier bridge left open?",
+  });
+  if (!approval.approved) {
+    textResult(id, notApprovedText(approval) + helperProblemNote());
+    return;
+  }
+  const report = await sessionManager.clearLeftover();
+  textResult(id, report + approverNote(approval) + helperProblemNote());
+}
+
 function handleListTargets(id) {
   const inventory = Object.entries(config.targets).map(([targetKey, target]) => ({
     target: targetKey,
@@ -469,6 +514,9 @@ async function handleToolsCall(id, params) {
         return;
       case "close_terminal":
         await handleCloseTerminal(id);
+        return;
+      case "clear_terminal":
+        await handleClearTerminal(id);
         return;
       case "list_targets":
         handleListTargets(id);

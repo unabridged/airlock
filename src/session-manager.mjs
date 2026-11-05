@@ -446,12 +446,51 @@ export class SessionManager {
   // The mirror of the leftover check, for an explicit adopt: taking over a
   // pane requires a pane. Same timing rule — before the overlay, so the human
   // is never asked to approve an adoption of nothing.
-  async assertLeftoverSession() {
+  async assertLeftoverSession(action = "adopt") {
     if (await this.sessionDefinitivelyDead()) {
       throw new SessionStateError(
-        "There is no session to adopt — no Airlock session is running. Open one with open_terminal.",
+        `There is no session to ${action} — no Airlock session is running. Open one with open_terminal.`,
       );
     }
+  }
+
+  // The explicit "clear" half of the leftover choice: the human has said the
+  // pane an earlier bridge left is dead, or wants it ended. It is never
+  // automatic, and it is not graceful — we do not know what that pane is
+  // running, and typing exit commands into an unknown prompt is how a clear
+  // becomes a wedged session. It takes the same cross-bridge lock as an open,
+  // so two bridges cannot race a clear, and it refuses while this bridge has
+  // a session of its own: that one is close_terminal's to end.
+  async clearLeftover() {
+    if (this.activeSession) {
+      throw new SessionStateError(
+        `This session has ${this.activeSession.targetKey} open. close_terminal ends the ` +
+          `session you have open; clear_terminal is for one an earlier bridge left behind.`,
+      );
+    }
+    const releaseSessionLock = this.acquireSessionLockNamingTheHolder();
+    try {
+      return await this.runExclusively("clear_terminal", async () => {
+        await this.assertLeftoverSession("clear");
+        const hint = this.leftoverTargetHint();
+        await this.tmux.saveFinalScreen();
+        await this.tmux.killSession();
+        rmSync(this.sessionStateFile, { force: true });
+        return `Cleared the leftover session${hint}. The tmux session and whatever it was running are terminated.`;
+      });
+    } finally {
+      releaseSessionLock();
+    }
+  }
+
+  leftoverTargetHint() {
+    try {
+      const state = JSON.parse(readFileSync(this.sessionStateFile, "utf8"));
+      if (typeof state.target === "string") return ` (last recorded state: ${state.target})`;
+    } catch {
+      // No readable state: the leftover is anonymous.
+    }
+    return "";
   }
 
   leftoverSessionText() {
@@ -473,8 +512,9 @@ export class SessionManager {
       `A remote session left by an earlier Airlock bridge is still running${leftoverDetail}. ` +
       `Airlock never kills it automatically — it may be live, possibly with the human ` +
       `attached. If it is the session you want, open_terminal with adopt: true takes it ` +
-      `over without sending anything. Otherwise ask the human to end it (attach in the ` +
-      `integrated terminal and exit the remote program), then open again. ` +
+      `over without sending anything; if the human says it is dead, clear_terminal ends ` +
+      `it. Otherwise ask the human to end it (attach in the integrated terminal and exit ` +
+      `the remote program), then open again. ` +
       attachBlockText(this.attachCommandLine, `One-click attach for the human (bash-fenced, verbatim):`)
     );
   }

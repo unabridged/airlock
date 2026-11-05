@@ -664,6 +664,48 @@ describe("SessionManager — adopt a leftover session", () => {
   });
 });
 
+describe("SessionManager — clear a leftover session", () => {
+  let stateDirectory;
+  beforeEach(() => {
+    stateDirectory = mkdtempSync(join(scratch, "clear-"));
+  });
+
+  function leftoverTmux() {
+    const tmux = new FakeShellTmux();
+    tmux.alive = true;
+    tmux.historyLines = [PROMPT];
+    return tmux;
+  }
+
+  it("ends the leftover and removes its state", async () => {
+    const tmux = leftoverTmux();
+    writeFileSync(
+      join(stateDirectory, "session.json"),
+      JSON.stringify({ target: "fake-shell", pid: 999999, opened_at: "2026-08-23T00:00:00Z" }),
+    );
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    const report = await sessionManager.clearLeftover();
+    assert.match(report, /^Cleared the leftover session/);
+    assert.match(report, /last recorded state: fake-shell/);
+    assert.equal(tmux.alive, false);
+    assert.equal(existsSync(join(stateDirectory, "session.json")), false);
+    acquireSessionLock(stateDirectory)(); // the clear released the lock
+  });
+
+  it("refuses to clear when nothing is running", async () => {
+    const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
+    await assert.rejects(sessionManager.clearLeftover(), /no session to clear/i);
+  });
+
+  it("refuses to clear while this bridge has its own session open", async () => {
+    const tmux = new FakeShellTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    await sessionManager.open("fake-shell");
+    await assert.rejects(sessionManager.clearLeftover(), /close_terminal ends the session you have open/);
+    assert.equal(tmux.alive, true);
+  });
+});
+
 // Liveness handling: a failed probe is not a dead session, and teardown never
 // races an in-flight operation.
 describe("SessionManager — liveness probes and teardown safety", () => {
