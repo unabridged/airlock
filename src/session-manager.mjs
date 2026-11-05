@@ -183,6 +183,25 @@ function createDriver(target) {
     : createShellDriver();
 }
 
+// "Who and when" for a state file written by a bridge that is no longer here.
+// Times are stored as ISO (UTC) and shown in the reader's local time: the
+// refusal is read by a person, and the issue that asked for this was filed
+// because a UTC timestamp made the other session hard to identify.
+function describeStateHolder(state) {
+  const parts = [];
+  if (state.client && typeof state.client.name === "string") {
+    parts.push(
+      typeof state.client.version === "string" ? `${state.client.name} ${state.client.version}` : state.client.name,
+    );
+  }
+  if (Number.isInteger(state.pid)) parts.push(`bridge pid ${state.pid}`);
+  if (typeof state.opened_at === "string") {
+    const opened = new Date(state.opened_at);
+    if (!Number.isNaN(opened.getTime())) parts.push(`opened ${opened.toLocaleString()}`);
+  }
+  return parts.length > 0 ? `, ${parts.join(", ")}` : "";
+}
+
 export class SessionManager {
   constructor({
     config,
@@ -198,6 +217,7 @@ export class SessionManager {
     this.stateDirectory = stateDirectory;
     this.sessionStateFile = join(stateDirectory, "session.json");
     this.activeSession = null;
+    this.clientInfo = null;
     this.openInFlight = false;
     this.pendingOperation = null;
     this.pendingOperationName = null;
@@ -230,7 +250,7 @@ export class SessionManager {
   // now" true for every prober while the human decides. Every handle must be
   // settled by exactly one of {SessionManager#commitOpen} /
   // {SessionManager#abortOpen}.
-  beginOpen(targetKey) {
+  beginOpen(targetKey, { adopt = false } = {}) {
     if (this.activeSession) {
       throw new SessionStateError(
         `A session is already open (${this.activeSession.targetKey}). Close it before opening another.`,
@@ -252,8 +272,22 @@ export class SessionManager {
     return {
       targetKey,
       target: this.config.targets[targetKey],
+      adopt,
       releaseSessionLock,
       settled: false,
+    };
+  }
+
+  // Who is asking, for the state file a later session reads when it finds this
+  // one's pane still running. clientInfo is whatever the MCP initialize named;
+  // only the product name and version are kept (the same reasoning as the
+  // overlay title: a display-intended string, not a credential).
+  noteClient(clientInfo) {
+    if (!clientInfo || typeof clientInfo !== "object") return;
+    if (typeof clientInfo.name !== "string" || clientInfo.name === "") return;
+    this.clientInfo = {
+      name: clientInfo.name,
+      ...(typeof clientInfo.version === "string" ? { version: clientInfo.version } : {}),
     };
   }
 
@@ -272,47 +306,63 @@ export class SessionManager {
   // lock on every failure path.
   async commitOpen(openHandle) {
     openHandle.settled = true;
-    const { targetKey, target, releaseSessionLock } = openHandle;
+    const { targetKey, target, adopt, releaseSessionLock } = openHandle;
     try {
       return await this.runExclusively("open_terminal", async () => {
-        await this.assertNoLeftoverSession();
+        if (adopt) await this.assertLeftoverSession();
+        else await this.assertNoLeftoverSession();
 
         const driver = createDriver(target);
         let startupReport;
         try {
-          // The launch argv is the pane's DIRECT command (no local login
-          // shell): the pane dies with the process, so a dead pane is the
-          // connection-liveness signal. See {buildLaunchArgv} — the one seam
-          // producing it.
-          await this.tmux.createSession(this.buildLaunchArgv(this.config, target));
+          if (!adopt) {
+            // The launch argv is the pane's DIRECT command (no local login
+            // shell): the pane dies with the process, so a dead pane is the
+            // connection-liveness signal. See {buildLaunchArgv} — the one
+            // seam producing it. An adopt takes the pane that is already
+            // there and never runs this.
+            await this.tmux.createSession(this.buildLaunchArgv(this.config, target));
+          }
           startupReport = await driver.start({
             tmux: this.tmux,
             timeouts: this.timeouts,
             outputCap: this.outputCap,
+            adopt,
           });
           // The state file lands BEFORE {activeSession} exists: if this write
           // fails, the catch below leaves the bridge fully closed — never
           // "session live but lock released".
           replaceFile(
             this.sessionStateFile,
-            JSON.stringify({ target: targetKey, pid: process.pid, opened_at: new Date().toISOString() }),
+            JSON.stringify({
+              target: targetKey,
+              pid: process.pid,
+              opened_at: new Date().toISOString(),
+              ...(this.clientInfo ? { client: this.clientInfo } : {}),
+              ...(adopt ? { adopted: true } : {}),
+            }),
             0o600,
           );
         } catch (err) {
-          // Best-effort reap of this call's OWN newborn session (never a
-          // leftover — the assert above proved none existed), even when
-          // createSession itself failed partway through pane setup. The
-          // original failure is what must surface; a kill that fails too
-          // leaves debris the next open's leftover refusal catches.
-          await this.tmux.killSession().catch(() => undefined);
+          if (!adopt) {
+            // Best-effort reap of this call's OWN newborn session (never a
+            // leftover — the assert above proved none existed), even when
+            // createSession itself failed partway through pane setup. The
+            // original failure is what must surface; a kill that fails too
+            // leaves debris the next open's leftover refusal catches.
+            await this.tmux.killSession().catch(() => undefined);
+          }
           // The waiters' generic timeout text promises "session preserved …
           // use interrupt_terminal" — true for send_terminal, false here:
-          // the half-open session was just reaped. Correct the record.
+          // the half-open session was just reaped. Correct the record. An
+          // adopted pane is NOT this call's to reap, so it is left alone.
           if (err instanceof Error) {
-            err.message +=
-              "\n[Airlock: this failure happened during open_terminal — the " +
-              "half-open session was cleaned up, so there is nothing to " +
-              "attach to or interrupt. Fix the cause and retry open_terminal.]";
+            err.message += adopt
+              ? "\n[Airlock: adoption failed — nothing was sent and the running " +
+                "session was left untouched. Attach to it, or end it, by hand.]"
+              : "\n[Airlock: this failure happened during open_terminal — the " +
+                "half-open session was cleaned up, so there is nothing to " +
+                "attach to or interrupt. Fix the cause and retry open_terminal.]";
           }
           throw err;
         }
@@ -322,7 +372,7 @@ export class SessionManager {
         // goal 5 / output capture) — only the attach command line, which
         // encapsulates all of those.
         return (
-          `Opened ${targetKey}. ${startupReport}\n\n` +
+          `${adopt ? "Adopted" : "Opened"} ${targetKey}. ${startupReport}\n\n` +
           attachBlockText(
             this.attachCommandLine,
             `Offer the human one-click eyes on this session: relay the attach ` +
@@ -342,8 +392,8 @@ export class SessionManager {
     }
   }
 
-  async open(targetKey) {
-    return this.commitOpen(this.beginOpen(targetKey));
+  async open(targetKey, options = {}) {
+    return this.commitOpen(this.beginOpen(targetKey, options));
   }
 
   // Live cross-bridge visibility for list_targets and the open handshake:
@@ -393,6 +443,17 @@ export class SessionManager {
     }
   }
 
+  // The mirror of the leftover check, for an explicit adopt: taking over a
+  // pane requires a pane. Same timing rule — before the overlay, so the human
+  // is never asked to approve an adoption of nothing.
+  async assertLeftoverSession() {
+    if (await this.sessionDefinitivelyDead()) {
+      throw new SessionStateError(
+        "There is no session to adopt — no Airlock session is running. Open one with open_terminal.",
+      );
+    }
+  }
+
   leftoverSessionText() {
     let leftoverDetail = "";
     try {
@@ -401,7 +462,9 @@ export class SessionManager {
       // leftover, or a manual attach-and-exit that had no bridge to clean up),
       // so its target is a hint, never an identification.
       if (typeof state.target === "string") {
-        leftoverDetail = ` (last recorded state: ${state.target} — possibly stale; trust the terminal, not this label)`;
+        leftoverDetail =
+          ` (last recorded state: ${state.target}${describeStateHolder(state)} — ` +
+          `possibly stale; trust the terminal, not this label)`;
       }
     } catch {
       // No readable state: the leftover session is anonymous.
@@ -409,8 +472,9 @@ export class SessionManager {
     return (
       `A remote session left by an earlier Airlock bridge is still running${leftoverDetail}. ` +
       `Airlock never kills it automatically — it may be live, possibly with the human ` +
-      `attached. Ask the human to end it (attach in the integrated terminal and exit ` +
-      `the remote program), then open again. ` +
+      `attached. If it is the session you want, open_terminal with adopt: true takes it ` +
+      `over without sending anything. Otherwise ask the human to end it (attach in the ` +
+      `integrated terminal and exit the remote program), then open again. ` +
       attachBlockText(this.attachCommandLine, `One-click attach for the human (bash-fenced, verbatim):`)
     );
   }

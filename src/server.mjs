@@ -117,7 +117,9 @@ function buildTools() {
       name: "open_terminal",
       description:
         "Open the single Airlock remote session against a configured target. " +
-        "Requires human approval in the native overlay. Errors if a session is already open.\n" +
+        "Requires human approval in the native overlay. Errors if a session is already open. " +
+        "If an earlier bridge left a session running, open_terminal with adopt: true takes " +
+        "it over instead: nothing is started and nothing is sent.\n" +
         `Targets:\n${targetInventoryLines().join("\n")}`,
       inputSchema: {
         type: "object",
@@ -126,6 +128,13 @@ function buildTools() {
             type: "string",
             enum: targetKeys,
             description: `The configured target to open:\n${targetInventoryLines().join("\n")}`,
+          },
+          adopt: {
+            type: "boolean",
+            description:
+              "Take over a session an earlier bridge left running instead of opening a " +
+              "new one. The target's driver must match the session that is there. " +
+              "Nothing is started and nothing is sent.",
           },
         },
         required: ["target"],
@@ -216,6 +225,10 @@ function handleInitialize(id, params) {
     // constant product identifier ("claude-ai") that would displace the far
     // more useful per-action question in the overlay header.
     claudeSessionName = (typeof clientInfo.title === "string" && clientInfo.title) || null;
+    // The name and version DO belong in the session state file: a later
+    // session that finds this one's pane still running needs to say who left
+    // it there.
+    sessionManager.noteClient(clientInfo);
   }
 
   const clientProductName =
@@ -295,27 +308,40 @@ async function handleOpenTerminal(id, args) {
   // all happen in beginOpen, BEFORE the overlay: the human is never asked to
   // approve an open that is already doomed, and the lock is held through the
   // approval wait (a probing session sees "opening right now", not a race).
+  const adopt = args.adopt === true;
   let openHandle;
   try {
-    openHandle = sessionManager.beginOpen(args.target);
+    openHandle = sessionManager.beginOpen(args.target, { adopt });
   } catch (err) {
     if (!isExpectedSessionError(err)) throw err;
     textResult(id, err.message, { isError: true });
     return;
   }
   try {
-    // The leftover-session check also runs BEFORE the overlay: a dead
+    // The session-presence check also runs BEFORE the overlay: a dead
     // bridge's debris is knowable now, and the human must never approve an
     // open that is already doomed ({SessionManager#commitOpen} re-checks
-    // authoritatively inside the exclusive queue).
-    await sessionManager.assertNoLeftoverSession();
+    // authoritatively inside the exclusive queue). An adopt inverts it — the
+    // pane must be there.
+    if (adopt) await sessionManager.assertLeftoverSession();
+    else await sessionManager.assertNoLeftoverSession();
     // The overlay always renders the resolved display_command, however the
-    // target was selected — that is the authoritative approval surface.
-    const approval = await approveOrExplain({
-      command: openHandle.target.display_command,
-      badge: openHandle.targetKey,
-      actionDescription: `Open ${openHandle.targetKey}?`,
-    });
+    // target was selected — that is the authoritative approval surface. An
+    // adopt runs no command, so it says so rather than showing one that will
+    // not be sent.
+    const approval = await approveOrExplain(
+      adopt
+        ? {
+            command: "(adopt the running session — nothing is sent)",
+            badge: `${openHandle.targetKey} · adopt`,
+            actionDescription: `Adopt the session left open on ${openHandle.targetKey}?`,
+          }
+        : {
+            command: openHandle.target.display_command,
+            badge: openHandle.targetKey,
+            actionDescription: `Open ${openHandle.targetKey}?`,
+          },
+    );
     if (!approval.approved) {
       textResult(id, notApprovedText(approval) + helperProblemNote());
       return;
