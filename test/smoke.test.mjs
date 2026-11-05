@@ -761,10 +761,18 @@ describe("server.mjs over stdio", () => {
       const toolsListed = await call("tools/list", {});
       assert.deepEqual(
         toolsListed.result.tools.map((tool) => tool.name).sort(),
-        ["close_terminal", "interrupt_terminal", "list_targets", "open_terminal", "send_terminal"],
+        [
+          "clear_terminal",
+          "close_terminal",
+          "interrupt_terminal",
+          "list_targets",
+          "open_terminal",
+          "send_terminal",
+        ],
       );
       const openTool = toolsListed.result.tools.find((tool) => tool.name === "open_terminal");
       assert.deepEqual(openTool.inputSchema.properties.target.enum, ["test-shell", "test-console"]);
+      assert.equal(openTool.inputSchema.properties.adopt.type, "boolean");
       assert.equal(openTool.inputSchema.additionalProperties, false);
 
       // Closing is a pure de-escalation and must advertise itself as ungated.
@@ -992,7 +1000,7 @@ describe("server.mjs over stdio", () => {
         const initialized = await server.call("initialize", { protocolVersion: "2025-06-18" });
         assert.match(initialized.result.instructions, /Test instructions\./);
         const toolsListed = await server.call("tools/list", {});
-        assert.equal(toolsListed.result.tools.length, 5);
+        assert.equal(toolsListed.result.tools.length, 6);
       }
     } finally {
       first.child.kill();
