@@ -9,7 +9,7 @@
 // of the protocol.
 
 import { closeSync, constants, ftruncateSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRailsIrbDriver } from "./drivers/rails-irb.mjs";
 import { createShellDriver } from "./drivers/shell.mjs";
@@ -118,7 +118,7 @@ export function acquireSessionLock(stateDirectory = STATE_DIRECTORY) {
       if (err.code !== "EAGAIN" && err.code !== "EWOULDBLOCK") throw err;
       if (attempt >= LOCK_ACQUIRE_ATTEMPTS) {
         throw new SessionStateError(
-          `Another Claude session's Airlock already has the remote session open — ` +
+          `Another session's Airlock already has the remote session open — ` +
             `only one Airlock session can be open at a time. Ask the human to close ` +
             `it in that session first, or to say which session should own it.`,
         );
@@ -189,6 +189,10 @@ function createDriver(target) {
 // because a UTC timestamp made the other session hard to identify.
 function describeStateHolder(state) {
   const parts = [];
+  if (typeof state.session === "string") parts.push(`session ${state.session}`);
+  if (typeof state.studio === "string") parts.push(`studio ${state.studio}`);
+  if (typeof state.project === "string") parts.push(`project ${state.project}`);
+  if (typeof state.profile === "string") parts.push(`profile ${state.profile}`);
   if (state.client && typeof state.client.name === "string") {
     parts.push(
       typeof state.client.version === "string" ? `${state.client.name} ${state.client.version}` : state.client.name,
@@ -202,6 +206,28 @@ function describeStateHolder(state) {
   return parts.length > 0 ? `, ${parts.join(", ")}` : "";
 }
 
+// The launcher's name for this session, handed in as plain environment (the
+// concord contract: CONCORD_SESSION, CONCORD_PROFILE, CONCORD_STUDIO). It is
+// not a credential and not part of MCP; it exists so a later session that
+// finds this one's shell still running can say *which* session left it.
+export function launcherContextFromEnv(environment = process.env) {
+  const fields = {
+    session: "CONCORD_SESSION",
+    profile: "CONCORD_PROFILE",
+    studio: "CONCORD_STUDIO",
+  };
+  const context = {};
+  for (const [field, name] of Object.entries(fields)) {
+    const value = environment[name];
+    if (typeof value === "string" && value.trim() !== "") context[field] = value.trim();
+  }
+  // The project is the human-findable part: a session id and a studio still
+  // do not tell a person which tab to look in, but the checkout's name does.
+  const root = environment.CONCORD_ROOT;
+  if (typeof root === "string" && root.trim() !== "") context.project = basename(root.trim());
+  return Object.keys(context).length > 0 ? context : null;
+}
+
 export class SessionManager {
   constructor({
     config,
@@ -209,6 +235,7 @@ export class SessionManager {
     tmux = new Tmux({ socketPath: join(stateDirectory, "tmux.sock") }),
     buildLaunchArgv: launchArgvBuilder = buildLaunchArgv,
     attachCommandLine = DEFAULT_ATTACH_COMMAND_LINE,
+    launcherContext = null,
   }) {
     this.config = config;
     this.tmux = tmux;
@@ -218,6 +245,7 @@ export class SessionManager {
     this.sessionStateFile = join(stateDirectory, "session.json");
     this.activeSession = null;
     this.clientInfo = null;
+    this.launcherContext = launcherContext;
     this.openInFlight = false;
     this.pendingOperation = null;
     this.pendingOperationName = null;
@@ -339,6 +367,7 @@ export class SessionManager {
               pid: process.pid,
               opened_at: new Date().toISOString(),
               ...(this.clientInfo ? { client: this.clientInfo } : {}),
+              ...(this.launcherContext ? { ...this.launcherContext } : {}),
               ...(adopt ? { adopted: true } : {}),
             }),
             0o600,
@@ -397,15 +426,24 @@ export class SessionManager {
   }
 
   // Live cross-bridge visibility for list_targets and the open handshake:
-  // which OTHER Claude session's bridge holds the session lock, and (when its
-  // state file is readable) what it has open.
+  // which other session's bridge holds the session lock, and (when its state
+  // file is readable) what it has open and which session it is.
   otherSessionHolder() {
     const holder = sessionLockHolder(this.stateDirectory);
     if (holder === null) return null;
     try {
       const state = JSON.parse(readFileSync(this.sessionStateFile, "utf8"));
       if (holder.pid !== null && state.pid === holder.pid) {
-        return { pid: holder.pid, target: state.target, opened_at: state.opened_at };
+        return {
+          pid: holder.pid,
+          target: state.target,
+          opened_at: state.opened_at,
+          ...(typeof state.session === "string" ? { session: state.session } : {}),
+          ...(typeof state.profile === "string" ? { profile: state.profile } : {}),
+          ...(typeof state.studio === "string" ? { studio: state.studio } : {}),
+          ...(typeof state.project === "string" ? { project: state.project } : {}),
+          ...(state.client && typeof state.client === "object" ? { client: state.client } : {}),
+        };
       }
     } catch {
       // Lock held but no readable state: an open is mid-flight there.
@@ -419,10 +457,12 @@ export class SessionManager {
     } catch (err) {
       if (err instanceof SessionStateError) {
         const otherSession = this.otherSessionHolder();
-        if (otherSession && otherSession.target) {
+        if (otherSession) {
+          const held = otherSession.target
+            ? `${otherSession.target} open${describeStateHolder(otherSession)}`
+            : `the remote session open${describeStateHolder(otherSession)}`;
           throw new SessionStateError(
-            `Another Claude session's Airlock has ${otherSession.target} open ` +
-              `(since ${otherSession.opened_at}) — only one Airlock session can be ` +
+            `Another session's Airlock has ${held} — only one Airlock session can be ` +
               `open at a time. Ask the human to close it in that session first, ` +
               `or to say which session should own it.`,
           );

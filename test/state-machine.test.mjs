@@ -23,7 +23,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it, mock } from "node:test";
 
-import { acquireSessionLock, SessionManager, SessionStateError } from "../src/session-manager.mjs";
+import {
+  acquireSessionLock,
+  launcherContextFromEnv,
+  SessionManager,
+  SessionStateError,
+} from "../src/session-manager.mjs";
 import { defaultTmuxExecutable, replaceFile, shellQuote, Tmux } from "../src/tmux.mjs";
 
 const PROMPT = "fake$ ";
@@ -114,7 +119,12 @@ class FakeShellTmux {
   }
 }
 
-function buildSessionManager({ tmux, stateDirectory, buildLaunchArgv = () => ["/usr/bin/true"] }) {
+function buildSessionManager({
+  tmux,
+  stateDirectory,
+  buildLaunchArgv = () => ["/usr/bin/true"],
+  launcherContext = null,
+}) {
   const config = {
     sshConfigPath: "/dev/null",
     instructions: "test",
@@ -138,6 +148,7 @@ function buildSessionManager({ tmux, stateDirectory, buildLaunchArgv = () => ["/
     stateDirectory,
     // The launch seam: unit tests never build a real launch argv at all.
     buildLaunchArgv,
+    launcherContext,
   });
 }
 
@@ -384,7 +395,7 @@ describe("SessionManager — cross-bridge session lock", () => {
         sessionManager.open("fake-shell"),
         (err) =>
           err instanceof SessionStateError &&
-          /Another Claude session's Airlock already has the remote session open/.test(err.message),
+          /Another session's Airlock has the remote session open/.test(err.message),
       );
       assert.equal(readFileSync(lockFile, "utf8"), String(holder.pid)); // untouched
     } finally {
@@ -395,7 +406,7 @@ describe("SessionManager — cross-bridge session lock", () => {
   it("releases a SIGKILLed bridge's lock by itself — no stale state to clear", async () => {
     const holder = await spawnLockHolder();
     const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
-    await assert.rejects(sessionManager.open("fake-shell"), /Another Claude session's Airlock/);
+    await assert.rejects(sessionManager.open("fake-shell"), /Another session's Airlock/);
     await killAndAwaitExit(holder);
     await sessionManager.open("fake-shell");
     assert.equal(sessionManager.activeTargetKey, "fake-shell");
@@ -486,6 +497,98 @@ describe("SessionManager — cross-bridge session lock", () => {
     }
     assert.equal(sessionManager.otherSessionHolder(), null); // released with the holder's death
   });
+
+  it("reads the launcher's session, profile, and studio from the environment", () => {
+    assert.deepEqual(
+      launcherContextFromEnv({
+        CONCORD_SESSION: "abc123",
+        CONCORD_PROFILE: "deepseek-v4-1-flash-1017-deepinfra",
+        CONCORD_STUDIO: "grant",
+        CONCORD_ROOT: "/Users/shoshin/code/projects/concord",
+      }),
+      {
+        session: "abc123",
+        profile: "deepseek-v4-1-flash-1017-deepinfra",
+        studio: "grant",
+        project: "concord",
+      },
+    );
+    assert.equal(launcherContextFromEnv({}), null);
+    assert.deepEqual(launcherContextFromEnv({ CONCORD_SESSION: "  ", CONCORD_STUDIO: " grant " }), {
+      studio: "grant",
+    });
+  });
+
+  it("records the launcher's session, profile, and studio in session.json", async () => {
+    const sessionManager = buildSessionManager({
+      tmux: new FakeShellTmux(),
+      stateDirectory,
+      launcherContext: { session: "abc123", profile: "p1", studio: "grant", project: "concord" },
+    });
+    await sessionManager.open("fake-shell");
+    const state = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
+    assert.equal(state.session, "abc123");
+    assert.equal(state.profile, "p1");
+    assert.equal(state.studio, "grant");
+    assert.equal(state.project, "concord");
+  });
+
+  it("names the live holder's session and studio, in local time", async () => {
+    const holder = await spawnLockHolder();
+    try {
+      writeFileSync(
+        join(stateDirectory, "session.json"),
+        JSON.stringify({
+          target: "fake-shell",
+          pid: holder.pid,
+          opened_at: "2026-08-23T00:00:00Z",
+          session: "abc123",
+          profile: "p1",
+          studio: "grant",
+          project: "concord",
+        }),
+      );
+      const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
+      await assert.rejects(sessionManager.open("fake-shell"), (err) => {
+        assert.match(err.message, /Another session's Airlock has fake-shell open/);
+        assert.match(err.message, /session abc123/);
+        assert.match(err.message, /studio grant/);
+        assert.match(err.message, /project concord/);
+        assert.match(err.message, /opened /);
+        assert.doesNotMatch(err.message, /2026-08-23T00:00:00Z/);
+        return true;
+      });
+    } finally {
+      await killAndAwaitExit(holder);
+    }
+  });
+
+  it("names the session and studio a leftover came from", async () => {
+    const tmux = new FakeShellTmux();
+    tmux.alive = true;
+    tmux.historyLines = [PROMPT];
+    writeFileSync(
+      join(stateDirectory, "session.json"),
+      JSON.stringify({
+        target: "fake-shell",
+        pid: 999999,
+        opened_at: "2026-08-23T00:00:00Z",
+        session: "abc123",
+        profile: "p1",
+        studio: "grant",
+        project: "concord",
+      }),
+    );
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    const error = await sessionManager.open("fake-shell").then(
+      () => assert.fail("open must refuse over a leftover session"),
+      (err) => err,
+    );
+    assert.match(error.message, /session abc123/);
+    assert.match(error.message, /studio grant/);
+    assert.match(error.message, /project concord/);
+    assert.match(error.message, /opened /);
+  });
 });
 
 // The open handshake: the lock is taken in beginOpen — BEFORE the human is
@@ -529,7 +632,7 @@ describe("SessionManager — open handshake (beginOpen/commitOpen/abortOpen)", (
     const openHandle = sessionManager.beginOpen("fake-shell");
     assert.throws(
       () => sessionManager.beginOpen("fake-shell"),
-      /already awaiting approval/, // NOT "Another Claude session's Airlock"
+      /already awaiting approval/, // NOT "Another session's Airlock"
     );
     sessionManager.abortOpen(openHandle);
   });

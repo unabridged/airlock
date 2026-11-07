@@ -30,7 +30,7 @@ import {
 import { loadConfig, transportCommandLine } from "./config.mjs";
 import { installationProblems, refusalText } from "./install-check.mjs";
 import { parseLaunchOptions, USAGE_TEXT, UsageError } from "./launch-options.mjs";
-import { isExpectedSessionError, SessionManager } from "./session-manager.mjs";
+import { isExpectedSessionError, launcherContextFromEnv, SessionManager } from "./session-manager.mjs";
 import { Tmux } from "./tmux.mjs";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
@@ -89,6 +89,9 @@ const sessionManager = new SessionManager({
   stateDirectory: launchOptions.stateDirectory,
   tmux: Tmux.forLaunch(launchOptions),
   attachCommandLine: launchOptions.attachCommandLine,
+  // The launcher's name for this session (CONCORD_SESSION/PROFILE/STUDIO),
+  // recorded in session.json so a later session can name the holder.
+  launcherContext: launcherContextFromEnv(),
 });
 
 // A missing helper is a call-time non-approval by contract, but the
@@ -489,6 +492,10 @@ function handleListTargets(id) {
         held_by_another_claude_session: otherSession && {
           target: otherSession.target,
           opened_at: otherSession.opened_at,
+          ...(otherSession.session ? { session: otherSession.session } : {}),
+          ...(otherSession.profile ? { profile: otherSession.profile } : {}),
+          ...(otherSession.studio ? { studio: otherSession.studio } : {}),
+          ...(otherSession.project ? { project: otherSession.project } : {}),
         },
         targets: inventory,
       },

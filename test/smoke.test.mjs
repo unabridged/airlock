@@ -1061,19 +1061,31 @@ describe("server.mjs over stdio", () => {
         arguments: { target: "test-shell" },
       });
       assert.equal(refused.result.isError, true);
-      assert.match(refused.result.content[0].text, /Another Claude session's Airlock/);
+      assert.match(refused.result.content[0].text, /Another session's Airlock/);
       assert.ok(!existsSync(overlayMarker), "the approval overlay must not have popped");
 
       // list_targets names the cross-session holder once its state is readable.
       writeFileSync(
         join(stateDirectory, "session.json"),
-        JSON.stringify({ target: "test-shell", pid: holder.pid, opened_at: "2026-08-23T00:00:00Z" }),
+        JSON.stringify({
+          target: "test-shell",
+          pid: holder.pid,
+          opened_at: "2026-08-23T00:00:00Z",
+          session: "abc123",
+          profile: "p1",
+          studio: "grant",
+          project: "concord",
+        }),
       );
       const listed = await call("tools/call", { name: "list_targets", arguments: {} });
       const inventory = JSON.parse(listed.result.content[0].text);
       assert.deepEqual(inventory.held_by_another_claude_session, {
         target: "test-shell",
         opened_at: "2026-08-23T00:00:00Z",
+        session: "abc123",
+        profile: "p1",
+        studio: "grant",
+        project: "concord",
       });
     } finally {
       holder.kill("SIGKILL");
