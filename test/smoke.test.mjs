@@ -1082,6 +1082,7 @@ describe("server.mjs over stdio", () => {
       assert.deepEqual(inventory.held_by_another_claude_session, {
         target: "test-shell",
         opened_at: "2026-08-23T00:00:00Z",
+        bridge_pid: holder.pid,
         session: "abc123",
         profile: "p1",
         studio: "grant",

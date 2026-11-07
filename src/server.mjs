@@ -492,6 +492,7 @@ function handleListTargets(id) {
         held_by_another_claude_session: otherSession && {
           target: otherSession.target,
           opened_at: otherSession.opened_at,
+          bridge_pid: otherSession.pid,
           ...(otherSession.session ? { session: otherSession.session } : {}),
           ...(otherSession.profile ? { profile: otherSession.profile } : {}),
           ...(otherSession.studio ? { studio: otherSession.studio } : {}),
