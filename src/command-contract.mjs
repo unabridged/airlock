@@ -24,16 +24,18 @@ const EXCERPT_LENGTH = 60;
 // guidance the model reads and the rules the bridge enforces cannot drift.
 //
 // Both drivers are named because the text goes out once, before any target is
-// open: `=` spacing is Ruby's spelling and a syntax error in a shell, and a
-// shell's quoting rules are noise in irb. Grouped by driver, so a model that
-// has opened one target is not taught the other's grammar as a general rule.
+// open: `=` spacing is Ruby's spelling, and in a shell `name = value` asks bash
+// for a command called `name` and reports `name: command not found`; a shell's
+// quoting rules are noise in irb. Grouped by driver, so a model that has opened
+// one target is not taught the other's grammar as a general rule.
 const SHARED_CONTRACT_RULES = [
   `- at most ${COMMAND_COLUMNS} columns per line and ${MAX_COMMAND_LINES} lines ` +
     "per send; split a longer script into several sends (console state " +
     "persists between sends)",
-  "- one statement per line: never join statements with `;`",
+  "- one statement per line: never join statements with `;` (a `for`, `while`, " +
+    "or `if` one-liner is the one allowed use: `; do`, `; then`, `;;`)",
   "- no comment lines; the code reads on its own through its names",
-  "- one blank line between sections, and each section ends in a labeled print",
+  "- one blank line between sections",
   "- plain ASCII outside string contents: no tabs, control characters, " +
     "zero-width or bidi characters, or non-ASCII spaces",
 ];
@@ -44,16 +46,17 @@ const RAILS_CONTRACT_RULES = [
   "- arrays fill-wrapped: several elements per line, up to " +
     `${COMMAND_COLUMNS} columns, never one element per line`,
   "- one leading-dot chained call per line",
-  "- a section's labeled print is `puts` (a multi-statement console paste " +
-    "prints only its final value)",
+  "- each section ends in a labeled print, and that print is `puts` (a " +
+    "multi-statement console paste prints only its final value)",
 ];
 
 const SHELL_CONTRACT_RULES = [
   "- no spaces around `=` in an assignment: `name=value`. `name = value` asks " +
     "bash for a command called `name`, so the value silently comes back empty",
   '- quote expansions that may be empty or contain spaces: `"$path"`, `"$@"`',
-  "- prefer one-line control flow (`for f in *.log; do wc -l $f; done`); each " +
-    "backslash continuation costs about a second",
+  "- wrap a long line with a trailing backslash, but prefer one-line control " +
+    'flow (`for log in *.log; do wc -l "$log"; done`) because each ' +
+    "continuation line costs about a second",
   "- a section's labeled print is `printf 'label: %s\\n' \"$value\"`",
 ];
 
@@ -105,8 +108,6 @@ export const CONTRACT_SPEC_TEXT = [
   ...SHELL_EXAMPLE,
 ].join("\n");
 
-export const CONTRACT_EXAMPLE_COMMAND = CONTRACT_EXAMPLES.rails_irb;
-
 const SHORT_NAME_ALLOWLIST = new Set(["id"]);
 const GENERIC_NAMES = new Set([
   "tmp", "obj", "val", "vals", "res", "ret", "arr", "str", "num", "rec", "recs",
@@ -132,6 +133,11 @@ const SHELL_HEREDOC_OPENER = /(?<!<)<<(?!<)(-?)\s*(["']?)(\w+)\2/;
 const SCALAR_ELEMENT_LINE = /^\s*(?:\w+|:\w+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'),\s*$/;
 const ARRAY_OPENER_LINE = /\[\s*$/;
 const SHELL_STATEMENT_EXEMPTIONS = /\\;|;\s*(?:do|then|done|fi|else|elif|esac)\b|;;/g;
+// A shell assignment is `name=value` with no spaces. `name = value` asks bash
+// for a command called `name` (`name: command not found`) and `name= value`
+// sets an empty name and runs `value`; both leave an empty variable behind,
+// which is quiet enough that the empty result reads as a fact.
+const SHELL_ASSIGNMENT_PATTERN = /^(?:\s*(?:export|local|readonly|declare)\s+)?([A-Za-z_]\w*)\s*=(?!=)/;
 const ASSIGNMENT_PATTERN =
   /^(\s*)([a-z_]\w*(?:\s*,\s*[a-z_]\w*)*)(\s*)(\|\||&&|[-+*/|&])?=(?![=~>])(\s*)(\S?)/;
 const BLOCK_PARAMS_PATTERN = /(?:\bdo|\{)\s*\|([^|]*)\|/;
@@ -286,6 +292,21 @@ function railsSpacingAndNameViolations(text, line, quoteFree) {
   return violations;
 }
 
+function shellSpacingViolation(text, line) {
+  const assignment = text.match(SHELL_ASSIGNMENT_PATTERN);
+  if (!assignment) return null;
+  const equals = text.indexOf("=", assignment.index);
+  const beforeEquals = text.slice(0, equals);
+  const afterEquals = text.slice(equals + 1);
+  if (!/\s$/.test(beforeEquals) && !/^\s/.test(afterEquals)) return null;
+  return {
+    line,
+    column: equals + 1,
+    rule: "spacing",
+    message: "no spaces around `=` in a shell assignment: `name=value`",
+  };
+}
+
 function widthViolation(text, line, rails) {
   const width = codePointWidth(text);
   if (width <= COMMAND_COLUMNS) return null;
@@ -381,6 +402,7 @@ function lineViolations(lines, driver) {
     const quoteFree = !/["'`]/.test(text);
     if (quoteFree) add(statementViolation(text, line, rails));
     if (rails) violations.push(...railsSpacingAndNameViolations(text, line, quoteFree));
+    else add(shellSpacingViolation(text, line));
   });
 
   if (rails) add(sectionsViolation(lines, inHeredoc));

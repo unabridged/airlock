@@ -10,7 +10,6 @@ import {
   checkCommandContract,
   COMMAND_COLUMNS,
   CONTRACT_EXAMPLES,
-  CONTRACT_EXAMPLE_COMMAND,
   CONTRACT_SPEC_TEXT,
   formatContractViolations,
   MAX_COMMAND_BYTES,
@@ -402,8 +401,8 @@ describe("the dense command and its rewrite", () => {
 
   it("accepts the example the spec text itself shows the model", () => {
     assert.match(CONTRACT_SPEC_TEXT, /Example \(12 lines\):/);
-    assert.equal(CONTRACT_EXAMPLE_COMMAND.split("\n").length, 12);
-    assertPasses(checkRuby(CONTRACT_EXAMPLE_COMMAND));
+    assert.equal(CONTRACT_EXAMPLES.rails_irb.split("\n").length, 12);
+    assertPasses(checkRuby(CONTRACT_EXAMPLES.rails_irb));
   });
 
   it("shows a shell example that passes for a shell, and the Ruby one does not", () => {
@@ -411,6 +410,32 @@ describe("the dense command and its rewrite", () => {
     assertPasses(checkShell(CONTRACT_EXAMPLES.shell));
     // The same text is not Ruby: `logs=0` has no space around `=`.
     assertRejects(checkRuby(CONTRACT_EXAMPLES.shell), "spacing");
+  });
+
+  it("flags a shell assignment that is spaced like Ruby's", () => {
+    // The text now says this breaks quietly; the bridge has to catch it before
+    // the human sees it, or the text is a promise the check does not keep.
+    assertRejects(checkShell("name = value"), "spacing");
+    assertRejects(checkShell("name= value"), "spacing");
+    assertRejects(checkShell("export name = value"), "spacing");
+    assertPasses(checkShell("name=value"));
+    // A comparison is not an assignment.
+    assertPasses(checkShell('if [ "$name" = "value" ]; then printf \'same\\n\'; fi'));
+  });
+
+  it("shows a shell one-liner that keeps its own quoting rule", () => {
+    const [, , shell] = CONTRACT_SPEC_TEXT.split(/\n(?:rails_irb \(Ruby\)|shell \(bash\)):\n/);
+    assert.match(shell, /for log in \*\.log; do wc -l "\$log"; done/);
+    assert.ok(!shell.includes("wc -l $f"), "the rule's example quotes its expansion");
+    assertPasses(checkShell('for log in *.log; do wc -l "$log"; done'));
+  });
+
+  it("does not promise every driver a labeled print in the shared rules", () => {
+    const [shared, rails, shell] = CONTRACT_SPEC_TEXT.split(/\n(?:rails_irb \(Ruby\)|shell \(bash\)):\n/);
+    assert.ok(!shared.includes("labeled print"), "sections are enforced for rails_irb only");
+    assert.match(rails, /each section ends in a labeled print/);
+    assert.match(shell, /a section's labeled print is `printf/);
+    assert.match(shared, /one-liner is the one allowed use/, "the `;` rule names its exception");
   });
 
   it("keeps Ruby's `=` spacing under the rails_irb heading, not in the shared rules", () => {

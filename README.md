@@ -59,17 +59,21 @@ fade. The bridge enforces these rules, and the tool description teaches them to
 the agent:
 
 - At most 80 columns per line, and at most 60 lines and 32 KiB per send.
-- One statement per line. Shell control flow such as `for f in *.log; do wc -l
-  $f; done` is the one allowed use of `;`.
+- One statement per line. A `for`/`while`/`if` one-liner such as `for log in
+  *.log; do wc -l "$log"; done` is the allowed use of `;`.
 - No comment lines.
-- Full-word variable names, such as `order` rather than `o` or `tmp`.
-- Spaces around `=` and after every comma.
-- Exactly one blank line between sections, and a multi-section command prints
-  labeled values such as `puts "count: #{count}"`.
-- Arrays fill-wrapped, never one element per line.
+- Exactly one blank line between sections.
 - No trailing spaces.
 - No tabs, control characters, zero-width or bidirectional characters, or
   non-ASCII spaces.
+- In Ruby: full-word variable names such as `order` rather than `o` or `tmp`,
+  spaces around `=` and after every comma, arrays fill-wrapped rather than one
+  element per line, one leading-dot chained call per line, and each section
+  ends in a labeled print such as `puts "count: #{count}"`.
+- In a shell: no spaces around `=` in an assignment (`name=value`, never
+  `name = value`, which asks bash for a command called `name`), quote
+  expansions that may be empty or contain spaces (`"$path"`), and a section's
+  labeled print is `printf 'label: %s\n' "$value"`.
 
 The bridge never reformats a command. Its only change is dropping one trailing
 newline. A rejected command never reaches the human, and the rejection lists
