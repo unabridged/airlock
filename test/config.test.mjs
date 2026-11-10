@@ -103,28 +103,50 @@ describe("loadConfig — errors name the config path and the problem", () => {
     assert.throws(() => loadConfig(), { name: "TypeError", message: "loadConfig requires the config file's path" });
   });
 
-  it("errors on a missing file, naming the path and never falling back", () => {
+  it("errors on a missing file, naming the path and telling you to create it", () => {
     const missingPath = join(scratch, "missing", "config.json");
     assert.throws(
       () => loadConfig(missingPath),
-      (err) =>
-        err.message.includes(missingPath) && err.message.includes("never falls back to the example"),
+      (err) => err.message.includes(missingPath) && err.message.includes("Create it"),
     );
   });
 
-  it("does not tell you to create a config that exists but cannot be opened", () => {
-    // A directory where the file should be: the path resolves, the open fails,
-    // and "Create it" would be the wrong advice.
+  it("says a directory is a directory, rather than asking you to create it", () => {
+    // A directory where the file should be: the path resolves, the open fails
+    // with EISDIR, and "Create it" would be the wrong advice.
     const directoryPath = join(scratch, "config-as-directory");
     mkdirSync(directoryPath, { recursive: true });
     assert.throws(
       () => loadConfig(directoryPath),
       (err) =>
         err.message.includes(directoryPath) &&
-        err.message.includes("could not be opened") &&
-        !err.message.includes("Create it") &&
-        err.message.includes("never falls back to the example"),
+        err.message.includes("is a directory, not a file") &&
+        !err.message.includes("Create it"),
     );
+  });
+
+  it("does not call a file missing when the way to it is denied", (t) => {
+    // EACCES arrives for a path that is not there, when a directory above it is
+    // not searchable. "Exists but cannot be opened" would be a claim the error
+    // cannot support; "permission denied" is true either way.
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      t.skip("root searches a 0o000 directory");
+      return;
+    }
+    const lockedDirectory = join(scratch, "locked");
+    mkdirSync(lockedDirectory, { recursive: true });
+    chmodSync(lockedDirectory, 0o000);
+    try {
+      assert.throws(
+        () => loadConfig(join(lockedDirectory, "nope.json")),
+        (err) =>
+          err.message.includes("permission denied") &&
+          !err.message.includes("Create it") &&
+          !err.message.includes("not readable"),
+      );
+    } finally {
+      chmodSync(lockedDirectory, 0o700);
+    }
   });
 
   it("names a denied read as an access problem, not a missing file", (t) => {
@@ -139,7 +161,7 @@ describe("loadConfig — errors name the config path and the problem", () => {
         () => loadConfig(deniedPath),
         (err) =>
           err.message.includes(deniedPath) &&
-          err.message.includes("exists but cannot be opened") &&
+          err.message.includes("permission denied") &&
           !err.message.includes("Create it"),
       );
     } finally {
