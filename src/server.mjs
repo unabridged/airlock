@@ -30,7 +30,7 @@ import {
 import { loadConfig, transportCommandLine } from "./config.mjs";
 import { installationProblems, refusalText } from "./install-check.mjs";
 import { parseLaunchOptions, USAGE_TEXT, UsageError } from "./launch-options.mjs";
-import { isExpectedSessionError, launcherContextFromEnv, SessionManager } from "./session-manager.mjs";
+import { isExpectedSessionError, sessionLabelFromEnv, SessionManager } from "./session-manager.mjs";
 import { Tmux } from "./tmux.mjs";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
@@ -89,9 +89,9 @@ const sessionManager = new SessionManager({
   stateDirectory: launchOptions.stateDirectory,
   tmux: Tmux.forLaunch(launchOptions),
   attachCommandLine: launchOptions.attachCommandLine,
-  // The launcher's name for this session (CONCORD_SESSION/PROFILE/STUDIO),
+  // The launcher's own label for this session (AIRLOCK_SESSION_LABEL),
   // recorded in session.json so a later session can name the holder.
-  launcherContext: launcherContextFromEnv(),
+  sessionLabel: sessionLabelFromEnv(),
 });
 
 // A missing helper is a call-time non-approval by contract, but the
@@ -529,10 +529,7 @@ function handleListTargets(id) {
           target: otherSession.target,
           opened_at: otherSession.opened_at,
           bridge_pid: otherSession.pid,
-          ...(otherSession.session ? { session: otherSession.session } : {}),
-          ...(otherSession.profile ? { profile: otherSession.profile } : {}),
-          ...(otherSession.studio ? { studio: otherSession.studio } : {}),
-          ...(otherSession.project ? { project: otherSession.project } : {}),
+          ...(otherSession.label ? { label: otherSession.label } : {}),
         },
         targets: inventory,
       },
