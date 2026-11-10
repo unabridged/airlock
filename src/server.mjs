@@ -122,7 +122,8 @@ function buildTools() {
         "Open the single Airlock remote session against a configured target. " +
         "Requires human approval in the native overlay. Errors if a session is already open. " +
         "If an earlier bridge left a session running, open_terminal with adopt: true takes " +
-        "it over instead: nothing is started and nothing is sent.\n" +
+        "it over instead: nothing is started, and the pane is not sent anything except, " +
+        "for a Rails console, the idempotent pager-disable line that proves it is IRB.\n" +
         `Targets:\n${targetInventoryLines().join("\n")}`,
       inputSchema: {
         type: "object",
@@ -136,8 +137,11 @@ function buildTools() {
             type: "boolean",
             description:
               "Take over a session an earlier bridge left running instead of opening a " +
-              "new one. The target's driver must match the session that is there. " +
-              "Nothing is started and nothing is sent.",
+              "new one. The leftover must be recorded as this target: Airlock refuses to " +
+              "adopt a pane the state file names differently, because every later " +
+              "approval would then show a target nobody checked. Nothing is started; " +
+              "the human sees the recorded target and the pane's last lines before " +
+              "approving.",
           },
         },
         required: ["target"],
@@ -187,9 +191,10 @@ function buildTools() {
       description:
         "End the session an earlier Airlock bridge left running, when the human has said " +
         "it is dead and may be discarded. Requires human approval in the native overlay: " +
-        "Airlock never ends a running session on its own. Use close_terminal for the " +
-        "session you have open, and open_terminal with adopt: true to take the leftover " +
-        "over instead.",
+        "Airlock never ends a running session on its own. Refuses without asking when " +
+        "another live bridge holds the session, or when this bridge has one open — use " +
+        "close_terminal for the session you have open, and open_terminal with adopt: true " +
+        "to take the leftover over instead.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -314,6 +319,27 @@ function helperProblemNote() {
   return problem ? `\n\nSetup warning: ${problem}` : "";
 }
 
+// What the human is approving when they approve an adopt: the record the pane
+// is being taken under, and the pane's own last lines. An adopt sends nothing
+// for a shell; a Rails console gets one idempotent line, because that
+// round-trip is the only proof the pane really is IRB.
+async function adoptOverlayText(openHandle) {
+  const rails = openHandle.target.driver === "rails_irb";
+  const paneTail = await sessionManager.leftoverPaneTail();
+  return [
+    rails
+      ? "Adopt the Rails console an earlier bridge left running."
+      : "Adopt the session an earlier bridge left running. Nothing is sent.",
+    rails
+      ? "One line is sent: the pager-disable check, which is the proof this pane is IRB."
+      : "",
+    sessionManager.describeRecordedLeftover(),
+    paneTail ? `pane now shows:\n${paneTail.map((line) => `  ${line}`).join("\n")}` : "pane: not readable",
+  ]
+    .filter((part) => part !== "")
+    .join("\n\n");
+}
+
 // ---- tool handlers --------------------------------------------------------
 
 async function handleOpenTerminal(id, args) {
@@ -335,17 +361,23 @@ async function handleOpenTerminal(id, args) {
     // bridge's debris is knowable now, and the human must never approve an
     // open that is already doomed ({SessionManager#commitOpen} re-checks
     // authoritatively inside the exclusive queue). An adopt inverts it — the
-    // pane must be there.
-    if (adopt) await sessionManager.assertLeftoverSession();
-    else await sessionManager.assertNoLeftoverSession();
+    // pane must be there — and adds one more question the human must not be
+    // asked to answer on the model's word: does the record agree with the
+    // target being adopted?
+    if (adopt) {
+      await sessionManager.assertLeftoverSession();
+      sessionManager.assertLeftoverIsTheRequestedTarget(openHandle.targetKey);
+    } else {
+      await sessionManager.assertNoLeftoverSession();
+    }
     // The overlay always renders the resolved display_command, however the
     // target was selected — that is the authoritative approval surface. An
-    // adopt runs no command, so it says so rather than showing one that will
-    // not be sent.
+    // adopt runs no open command, so it shows the pane instead: the record it
+    // is being adopted under, and what the terminal looks like right now.
     const approval = await approveOrExplain(
       adopt
         ? {
-            command: "(adopt the running session — nothing is sent)",
+            command: await adoptOverlayText(openHandle),
             badge: `${openHandle.targetKey} · adopt`,
             actionDescription: `Adopt the session left open on ${openHandle.targetKey}?`,
           }
@@ -439,17 +471,19 @@ async function handleCloseTerminal(id) {
 
 // Gated, unlike close_terminal: closing only ever ends the session this bridge
 // owns, while a clear destroys a pane nobody in this session is holding — it
-// may be live, and may have a human attached. The pre-check runs before the
-// overlay so the human is never asked to approve a clear with nothing to
-// clear; {SessionManager#clearLeftover} re-checks inside the cross-bridge lock.
+// may be live, and may have a human attached. Every refusal runs before the
+// overlay so the human is never asked to approve a clear that cannot happen:
+// nothing to clear, this bridge's own session, or a live holder on the lock.
+// {SessionManager#clearLeftover} re-checks inside the cross-bridge lock.
 async function handleClearTerminal(id) {
-  if (sessionManager.activeTargetKey) {
-    textResult(
-      id,
-      `This session has ${sessionManager.activeTargetKey} open. close_terminal ends the ` +
-        `session you have open; clear_terminal is for one an earlier bridge left behind.`,
-      { isError: true },
-    );
+  const ownSession = sessionManager.activeSessionClearRefusal();
+  if (ownSession) {
+    textResult(id, ownSession, { isError: true });
+    return;
+  }
+  const held = sessionManager.otherSessionHoldsRefusal();
+  if (held) {
+    textResult(id, held, { isError: true });
     return;
   }
   try {
@@ -487,9 +521,11 @@ function handleListTargets(id) {
     JSON.stringify(
       {
         active_session: sessionManager.activeTargetKey,
-        // Which OTHER Claude session holds the one Airlock session, if any —
-        // so "the airlock is busy" is diagnosable instead of confusing.
-        held_by_another_claude_session: otherSession && {
+        // Which OTHER session holds the one Airlock session, if any — so "the
+        // airlock is busy" is diagnosable instead of confusing. The name of
+        // the field is not a product's: this bridge cannot know what client
+        // the other one is (T10).
+        held_by_another_session: otherSession && {
           target: otherSession.target,
           opened_at: otherSession.opened_at,
           bridge_pid: otherSession.pid,

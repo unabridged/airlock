@@ -337,8 +337,14 @@ export class SessionManager {
     const { targetKey, target, adopt, releaseSessionLock } = openHandle;
     try {
       return await this.runExclusively("open_terminal", async () => {
-        if (adopt) await this.assertLeftoverSession();
-        else await this.assertNoLeftoverSession();
+        if (adopt) {
+          await this.assertLeftoverSession();
+          // Authoritative under the lock; the server asks the same question
+          // before the overlay so a person is never shown a doomed adopt.
+          this.assertLeftoverIsTheRequestedTarget(targetKey);
+        } else {
+          await this.assertNoLeftoverSession();
+        }
 
         const driver = createDriver(target);
         let startupReport;
@@ -360,15 +366,27 @@ export class SessionManager {
           // The state file lands BEFORE {activeSession} exists: if this write
           // fails, the catch below leaves the bridge fully closed — never
           // "session live but lock released".
+          // An adopt takes over what is there, so the record keeps the time
+          // and the client that OPENED the pane and gains only the holder that
+          // took it. Rewriting them would make the leftover's history look
+          // like this session's, which is the record a later leftover refusal
+          // has to be able to trust.
+          const recorded = adopt ? this.recordedLeftoverState() : null;
+          const openedAt =
+            typeof recorded?.opened_at === "string" ? recorded.opened_at : new Date().toISOString();
+          const client = recorded?.client ?? this.clientInfo;
+          // A fresh open records this launcher's naming; an adopt keeps the
+          // opener's and only marks itself.
+          const naming = adopt ? { adopted: true } : this.launcherContext;
           replaceFile(
             this.sessionStateFile,
             JSON.stringify({
+              ...(recorded ?? {}),
               target: targetKey,
               pid: process.pid,
-              opened_at: new Date().toISOString(),
-              ...(this.clientInfo ? { client: this.clientInfo } : {}),
-              ...(this.launcherContext ? { ...this.launcherContext } : {}),
-              ...(adopt ? { adopted: true } : {}),
+              opened_at: openedAt,
+              ...(client ? { client } : {}),
+              ...naming,
             }),
             0o600,
           );
@@ -451,6 +469,16 @@ export class SessionManager {
     return { pid: holder.pid, target: null, opened_at: null };
   }
 
+  // "portal-production-console open (session …, studio …, opened …)", or just
+  // the session when its state file is not readable yet. Shared by the lock
+  // refusal and the clear pre-check so the two cannot describe one holder
+  // differently.
+  otherSessionHeldPhrase(otherSession) {
+    return otherSession.target
+      ? `${otherSession.target} open${describeStateHolder(otherSession)}`
+      : `the remote session open${describeStateHolder(otherSession)}`;
+  }
+
   acquireSessionLockNamingTheHolder() {
     try {
       return acquireSessionLock(this.stateDirectory);
@@ -458,17 +486,85 @@ export class SessionManager {
       if (err instanceof SessionStateError) {
         const otherSession = this.otherSessionHolder();
         if (otherSession) {
-          const held = otherSession.target
-            ? `${otherSession.target} open${describeStateHolder(otherSession)}`
-            : `the remote session open${describeStateHolder(otherSession)}`;
           throw new SessionStateError(
-            `Another session's Airlock has ${held} — only one Airlock session can be ` +
-              `open at a time. Ask the human to close it in that session first, ` +
-              `or to say which session should own it.`,
+            `Another session's Airlock has ${this.otherSessionHeldPhrase(otherSession)} — ` +
+              `only one Airlock session can be open at a time. Ask the human to close it ` +
+              `in that session first, or to say which session should own it.`,
           );
         }
       }
       throw err;
+    }
+  }
+
+  // What a clear would fail on, asked BEFORE the overlay. The lock is taken
+  // inside {SessionManager#clearLeftover}, so a live holder means the human
+  // would be asked to approve "end the session an earlier bridge left open?"
+  // and then refused — a true outcome from a false question.
+  otherSessionHoldsRefusal() {
+    const otherSession = this.otherSessionHolder();
+    if (!otherSession) return null;
+    return (
+      `Another session's Airlock has ${this.otherSessionHeldPhrase(otherSession)} — a ` +
+      `clear would fail on the cross-bridge lock, so it is not offered. Ask the human ` +
+      `to close it in that session first, or to say which session should own it.`
+    );
+  }
+
+  // The state an earlier bridge left behind, or null when it is unreadable.
+  // Always a hint, never an identification: the file can outlive the session
+  // it described.
+  recordedLeftoverState() {
+    try {
+      const state = JSON.parse(readFileSync(this.sessionStateFile, "utf8"));
+      return state && typeof state === "object" ? state : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // One line for the adopt overlay: the record the pane is being taken under.
+  describeRecordedLeftover() {
+    const recorded = this.recordedLeftoverState();
+    if (!recorded) return "no recorded state — the pane is unidentified";
+    const target = typeof recorded.target === "string" ? recorded.target : "an unnamed target";
+    return `recorded as ${target}${describeStateHolder(recorded)}`;
+  }
+
+  // An adopt may only take the pane it was RECORDED as. Without this the model
+  // names the target, the overlay repeats the name it was given, and
+  // session.json is rewritten to agree — so every later approval shows a target
+  // nobody checked, and the driver's contract (Ruby's rules for a shell, or the
+  // reverse) is applied to the wrong pane. The record can be stale, so the
+  // refusal names both ways out instead of insisting.
+  assertLeftoverIsTheRequestedTarget(targetKey) {
+    const recorded = this.recordedLeftoverState();
+    if (!recorded || typeof recorded.target !== "string") return;
+    if (recorded.target === targetKey) return;
+    throw new SessionStateError(
+      `The session left running was recorded as ${recorded.target}, not ${targetKey}. ` +
+        `Airlock will not adopt it as a target it was not recorded as: the label would ` +
+        `be wrong from then on, and every later approval would show the wrong target. ` +
+        `open_terminal with target ${recorded.target} adopts it as recorded, or ` +
+        `clear_terminal ends it. If the record is stale, clear it and open afresh.`,
+    );
+  }
+
+  // The last few lines of the leftover pane, for the adopt overlay: the one
+  // piece of evidence a person has that the pane is what the record claims.
+  // Visible text only (capture-pane without -e), control characters dropped,
+  // and short enough to read at the overlay's 80 columns.
+  async leftoverPaneTail({ lines = 6, columns = 76 } = {}) {
+    try {
+      const screen = await this.tmux.capturePane();
+      const tail = screen
+        .split("\n")
+        .slice(-lines)
+        .map((text) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/\s+$/, ""))
+        .map((text) => (text.length > columns ? `${text.slice(0, columns - 1)}…` : text));
+      return tail.some((text) => text !== "") ? tail : null;
+    } catch {
+      return null;
     }
   }
 
@@ -501,13 +597,19 @@ export class SessionManager {
   // becomes a wedged session. It takes the same cross-bridge lock as an open,
   // so two bridges cannot race a clear, and it refuses while this bridge has
   // a session of its own: that one is close_terminal's to end.
+  // One text for both clear paths — the pre-overlay check in the server and
+  // the authoritative one here — so the two cannot drift.
+  activeSessionClearRefusal() {
+    if (!this.activeSession) return null;
+    return (
+      `This session has ${this.activeSession.targetKey} open. close_terminal ends the ` +
+      `session you have open; clear_terminal is for one an earlier bridge left behind.`
+    );
+  }
+
   async clearLeftover() {
-    if (this.activeSession) {
-      throw new SessionStateError(
-        `This session has ${this.activeSession.targetKey} open. close_terminal ends the ` +
-          `session you have open; clear_terminal is for one an earlier bridge left behind.`,
-      );
-    }
+    const refusal = this.activeSessionClearRefusal();
+    if (refusal) throw new SessionStateError(refusal);
     const releaseSessionLock = this.acquireSessionLockNamingTheHolder();
     try {
       return await this.runExclusively("clear_terminal", async () => {

@@ -741,6 +741,73 @@ describe("SessionManager — adopt a leftover session", () => {
     assert.deepEqual(state.client, { name: "pi", version: "1.4.0" });
   });
 
+  it("refuses to adopt a pane that was recorded as a different target", async () => {
+    // The blocker: adopt used to trust the target the model named, rewrite
+    // session.json to agree, and leave every later approval showing a target
+    // nobody checked — and the driver's rules applied to the wrong pane.
+    const tmux = leftoverTmux();
+    tmux.historyLines = ["irb(main):001> "];
+    writeFileSync(
+      join(stateDirectory, "session.json"),
+      JSON.stringify({ target: "portal-production-console", pid: 999999, opened_at: "2026-11-01T00:00:00Z" }),
+    );
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    const refusal = await sessionManager.open("fake-shell", { adopt: true }).then(
+      () => assert.fail("adopt must refuse a target the record contradicts"),
+      (err) => err,
+    );
+    assert.match(refusal.message, /recorded as portal-production-console, not fake-shell/);
+    assert.match(refusal.message, /open_terminal with target portal-production-console/);
+    assert.equal(sessionManager.activeTargetKey, null);
+    assert.deepEqual(tmux.historyLines, ["irb(main):001> "], "nothing was sent to the pane");
+    const state = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
+    assert.equal(state.target, "portal-production-console", "the record is not rewritten");
+  });
+
+  it("keeps the record's open time and client when it adopts", async () => {
+    // An adopt takes over what is there: the record keeps who opened the pane
+    // and when, and gains only the holder that took it.
+    const tmux = leftoverTmux();
+    writeFileSync(
+      join(stateDirectory, "session.json"),
+      JSON.stringify({
+        target: "fake-shell",
+        pid: 999999,
+        opened_at: "2026-11-01T00:00:00Z",
+        client: { name: "claude-code", version: "2.0.1" },
+        session: "abc123",
+      }),
+    );
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    sessionManager.noteClient({ name: "pi", version: "1.4.0" });
+    await sessionManager.open("fake-shell", { adopt: true });
+    const state = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
+    assert.equal(state.opened_at, "2026-11-01T00:00:00Z");
+    assert.deepEqual(state.client, { name: "claude-code", version: "2.0.1" });
+    assert.equal(state.session, "abc123");
+    assert.equal(state.pid, process.pid, "the record names the bridge holding it now");
+    assert.equal(state.adopted, true);
+  });
+
+  it("adopts a pane it has no record for, and says so", async () => {
+    // No state file: nothing to contradict the requested target, and the
+    // overlay shows the pane itself, so the human is the check.
+    const tmux = leftoverTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    assert.equal(sessionManager.describeRecordedLeftover(), "no recorded state — the pane is unidentified");
+    const report = await sessionManager.open("fake-shell", { adopt: true });
+    assert.match(report, /^Adopted fake-shell\./);
+  });
+
+  it("shows the pane's last lines for the adopt overlay", async () => {
+    const tmux = leftoverTmux();
+    tmux.historyLines = ["banner", "\u001b[1mbold\u001b[0m text", "irb(main):001> "];
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    // The trailing space of a prompt is trimmed, and the escapes a pane can
+    // carry are stripped: the overlay shows text, not terminal control.
+    assert.deepEqual(await sessionManager.leftoverPaneTail(), ["banner", "[1mbold[0m text", "irb(main):001>"]);
+  });
+
   it("refuses to adopt when there is no session running", async () => {
     const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
     await assert.rejects(sessionManager.open("fake-shell", { adopt: true }), /no session to adopt/i);
