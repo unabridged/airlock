@@ -54,6 +54,15 @@ Agent sees six tools:
 Deny can carry a feedback note, which rides back to the agent so it can adjust 
 and resend.
 
+**Naming the holder.** A refusal says which session holds the gate, and it can
+only say what the launcher tells it. If the launcher sets
+`AIRLOCK_SESSION_LABEL` — one plain, non-secret line, such as
+`session 4de569de, studio grant, project concord` — that is what a refusal and
+`list_targets` show. It is one generic variable rather than any one launcher's
+set, so a session started by any harness can name itself; without it the record
+still carries the MCP client, the bridge pid, and the open time, and an older
+`session.json` is still described from its own fields.
+
 **Style contract:** `send_terminal` checks every command against a style
 contract before the overlay pops, so the human only reviews text they can read
 at a glance. The overlay shows every approved byte at 80 columns without a
