@@ -39,15 +39,17 @@ package yourself, see
 
 ## Using it
 
-Agent sees five tools:
+Agent sees six tools:
 
 | Tool | Approval | What it does |
 | --- | --- | --- |
-| `list_targets` | none | Lists the configured targets (name, description, the exact command an open would run). |
+| `list_targets` | none | Lists the configured targets (name, description, the exact command an open would run), and which session holds the one open session. |
 | `open_terminal` | overlay | Starts the session for one target: `ssh <alias>`, then the target's startup lines (e.g. `bin/rails console`). |
+| `open_terminal` with `adopt: true` | overlay | Takes over the pane an earlier bridge left running, under the target the state file recorded. Nothing is started; a Rails console gets one idempotent line (the pager-disable check that proves it is IRB). |
 | `send_terminal` | overlay | Types one command into the session and returns the captured output. |
 | `interrupt_terminal` | overlay | Sends a real Ctrl-C to the running command. |
 | `close_terminal` | none | Exits the remote program and tears the session down. |
+| `clear_terminal` | overlay | Ends the pane an earlier bridge left running, when the human says it is dead. Never automatic, and never while another live bridge holds it. |
 
 Deny can carry a feedback note, which rides back to the agent so it can adjust 
 and resend.

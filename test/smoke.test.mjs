@@ -1079,7 +1079,7 @@ describe("server.mjs over stdio", () => {
       );
       const listed = await call("tools/call", { name: "list_targets", arguments: {} });
       const inventory = JSON.parse(listed.result.content[0].text);
-      assert.deepEqual(inventory.held_by_another_claude_session, {
+      assert.deepEqual(inventory.held_by_another_session, {
         target: "test-shell",
         opened_at: "2026-08-23T00:00:00Z",
         bridge_pid: holder.pid,
@@ -1088,6 +1088,28 @@ describe("server.mjs over stdio", () => {
         studio: "grant",
         project: "concord",
       });
+    } finally {
+      holder.kill("SIGKILL");
+      child.kill();
+    }
+  });
+
+  it("refuses clear_terminal before the overlay while another bridge holds the lock", async () => {
+    // A clear takes the cross-bridge lock, so with a live holder it can only
+    // fail. It used to ask "end the session an earlier bridge left open?" and
+    // then refuse — safe, but the question was false.
+    const overlayMarker = join(scratch, `e2e-clear-marker-${Math.random().toString(36).slice(2)}`);
+    const { child, call, stateDirectory } = startServer({
+      helperScript: `touch ${overlayMarker}; cat > /dev/null; printf '{"decision":"approve"}'`,
+    });
+    const holder = await spawnLockHolder(join(stateDirectory, "airlock.lock"));
+    try {
+      await call("initialize", { protocolVersion: "2025-06-18" });
+      const refused = await call("tools/call", { name: "clear_terminal", arguments: {} });
+      assert.equal(refused.result.isError, true);
+      assert.match(refused.result.content[0].text, /Another session's Airlock has/);
+      assert.match(refused.result.content[0].text, /clear would fail on the cross-bridge lock/);
+      assert.ok(!existsSync(overlayMarker), "the approval overlay must not have popped");
     } finally {
       holder.kill("SIGKILL");
       child.kill();

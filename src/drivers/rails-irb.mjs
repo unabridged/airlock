@@ -207,15 +207,11 @@ export function createRailsIrbDriver({ startupCommands = [] } = {}) {
       });
       promptLine = settledSnapshot.lastLine;
       promptPatterns = buildIrbPromptPatterns(promptLine);
-      if (adopt) {
-        // Nothing is sent on an adopt, so the pager-disable round-trip that
-        // normally proves this is IRB is skipped: the console that is here
-        // already ran it (or did not) when it was first opened.
-        return (
-          `Rails console adopted (detected prompt: ${JSON.stringify(promptLine)}; ` +
-          `the pager state is whatever the previous session left).`
-        );
-      }
+      // The round-trip runs on an adopt too, even though the rest of the
+      // handshake sends nothing: the candidate test accepts any settled line
+      // ending in `>` (a shell prompt, a `[y/N]` question), so without it an
+      // adopt is a guess about what is on the other side. The command is
+      // idempotent — re-disabling a disabled pager costs one line.
       const pagerReport = await runAtPrompt({
         tmux,
         command: DISABLE_PAGER_COMMAND,
@@ -235,7 +231,8 @@ export function createRailsIrbDriver({ startupCommands = [] } = {}) {
         );
       }
       return (
-        `Rails console ready (detected prompt: ${JSON.stringify(promptLine)}; ` +
+        `${adopt ? "Rails console adopted" : "Rails console ready"} ` +
+        `(detected prompt: ${JSON.stringify(promptLine)}; ` +
         `pager disabled via ${DISABLE_PAGER_COMMAND}).`
       );
     },

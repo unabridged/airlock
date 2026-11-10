@@ -337,6 +337,8 @@ A localized/custom MFA prompt, unusual host-key prompt, captive application, or 
 
 Negative recognition of known authentication prompts is useful UX, but it is not proof that authentication completed.
 
+An adopt inherits this risk without having watched the startup: the pane may be sitting at a `[y/N]` question, and the candidate test would take that line for the prompt. Two things narrow it rather than fix it. The approval overlay shows the pane's last lines beside the recorded target, so the human approves what is actually on screen rather than a label. And a `rails_irb` adopt sends the idempotent pager-disable line and requires its echoed `false`, which a shell prompt that happens to end in `>` cannot produce.
+
 ### Proposed fix
 
 Require a positive, target-specific readiness signal before any automatic startup line or user command is sent. Options include:

@@ -250,6 +250,11 @@ like this to your `CLAUDE.md`:
 - **Never run `ssh`/`scp`/`sftp` directly from Bash**, and never reconstruct
   connection details from Capistrano configs, deploy scripts, or `~/.ssh/config`.
   The Airlock target list is the only sanctioned path to remote hosts.
+- If an earlier bridge left a session running, `open_terminal` with
+  `adopt: true` takes that pane over — under the target the state file recorded,
+  and only after the human has seen the pane's last lines in the overlay. If the
+  human says that pane is dead, `clear_terminal` ends it. Neither is automatic:
+  Airlock never kills a session on its own.
 - If the `airlock` server shows as unavailable (its single-instance lock is
   likely held by another open Claude session), say so and ask the user — do not
   fall back to direct SSH.
