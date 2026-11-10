@@ -34,28 +34,40 @@ const DEFAULTS = {
 // at it wants "create it". A path that is there but cannot be opened — a
 // permission bit, a sandbox policy, a directory in its place — wants "fix the
 // access"; telling someone to create a file that already exists sends them
-// looking in the wrong place.
+// looking in the wrong place. A directory where the file should be is the
+// third case and says so, because readFileSync answers it with EISDIR.
+//
+// None of these fall back to the example: a config that cannot be read is a
+// refusal, not a default, and the person is the one who has to fix it.
 const MISSING_CONFIG_CODES = new Set(["ENOENT", "ENOTDIR"]);
 const UNREADABLE_CONFIG_CODES = new Set(["EACCES", "EPERM"]);
+const NOT_A_FILE_CODES = new Set(["EISDIR"]);
 
 function configOpenError(configPath, err) {
   const code = err?.code;
   if (MISSING_CONFIG_CODES.has(code)) {
     return new Error(
       `Airlock config not readable at ${configPath}: ${err.message}. ` +
-        `Create it (see config.example.json in the airlock repo) — the bridge never falls back to the example.`,
+        `Create it (see config.example.json in the airlock repo).`,
     );
   }
   if (UNREADABLE_CONFIG_CODES.has(code)) {
+    // Not "exists but cannot be opened": EACCES also arrives for a file that is
+    // not there, when a directory above it is not searchable, and a sandbox's
+    // EPERM cannot tell either. What is true in every case is the denial.
     return new Error(
-      `Airlock config at ${configPath} exists but cannot be opened: ${err.message}. ` +
-        `Check that it is a readable file, and — when the server runs under a sandbox — that the sandbox allows reading it. ` +
-        `The bridge never falls back to the example.`,
+      `Airlock config at ${configPath} cannot be opened (permission denied): ${err.message}. ` +
+        `Check that it is a readable file, and — when the server runs under a sandbox — that the sandbox allows reading it. `,
+    );
+  }
+  if (NOT_A_FILE_CODES.has(code)) {
+    return new Error(
+      `Airlock config at ${configPath} is a directory, not a file: ${err.message}. ` +
+        `Point the bridge at a config file, or move the directory out of the way.`,
     );
   }
   return new Error(
-    `Airlock config at ${configPath} could not be opened: ${err.message}. ` +
-      `The bridge never falls back to the example.`,
+    `Airlock config at ${configPath} could not be opened: ${err.message}. `,
   );
 }
 
