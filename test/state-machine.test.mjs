@@ -25,9 +25,9 @@ import { after, beforeEach, describe, it, mock } from "node:test";
 
 import {
   acquireSessionLock,
-  launcherContextFromEnv,
   SessionManager,
   SessionStateError,
+  sessionLabelFromEnv,
 } from "../src/session-manager.mjs";
 import { defaultTmuxExecutable, replaceFile, shellQuote, Tmux } from "../src/tmux.mjs";
 
@@ -123,7 +123,7 @@ function buildSessionManager({
   tmux,
   stateDirectory,
   buildLaunchArgv = () => ["/usr/bin/true"],
-  launcherContext = null,
+  sessionLabel = null,
 }) {
   const config = {
     sshConfigPath: "/dev/null",
@@ -148,7 +148,7 @@ function buildSessionManager({
     stateDirectory,
     // The launch seam: unit tests never build a real launch argv at all.
     buildLaunchArgv,
-    launcherContext,
+    sessionLabel,
   });
 }
 
@@ -498,39 +498,48 @@ describe("SessionManager — cross-bridge session lock", () => {
     assert.equal(sessionManager.otherSessionHolder(), null); // released with the holder's death
   });
 
-  it("reads the launcher's session, profile, and studio from the environment", () => {
-    assert.deepEqual(
-      launcherContextFromEnv({
-        CONCORD_SESSION: "abc123",
-        CONCORD_PROFILE: "deepseek-v4-1-flash-1017-deepinfra",
-        CONCORD_STUDIO: "grant",
-        CONCORD_ROOT: "/Users/shoshin/code/projects/concord",
-      }),
-      {
-        session: "abc123",
-        profile: "deepseek-v4-1-flash-1017-deepinfra",
-        studio: "grant",
-        project: "concord",
-      },
+  it("reads the launcher's label from one generic variable", () => {
+    // One variable, whatever the launcher: a tool that only understands one
+    // harness's names cannot name the sessions it exists to name (T1).
+    assert.equal(
+      sessionLabelFromEnv({ AIRLOCK_SESSION_LABEL: "session abc123, studio grant, project concord" }),
+      "session abc123, studio grant, project concord",
     );
-    assert.equal(launcherContextFromEnv({}), null);
-    assert.deepEqual(launcherContextFromEnv({ CONCORD_SESSION: "  ", CONCORD_STUDIO: " grant " }), {
-      studio: "grant",
-    });
+    assert.equal(sessionLabelFromEnv({}), null);
+    assert.equal(sessionLabelFromEnv({ AIRLOCK_SESSION_LABEL: "   " }), null);
+    assert.equal(sessionLabelFromEnv({ CONCORD_SESSION: "abc123" }), null, "no launcher's name is special");
   });
 
-  it("records the launcher's session, profile, and studio in session.json", async () => {
+  it("keeps the label to one line and a readable length", () => {
+    // It is printed in a refusal a person reads, and written into a state file.
+    assert.equal(sessionLabelFromEnv({ AIRLOCK_SESSION_LABEL: "session abc\nstudio grant\t" }), "session abc studio grant");
+    assert.equal(sessionLabelFromEnv({ AIRLOCK_SESSION_LABEL: "\u001b[1magent\u001b[0m" }), "[1magent[0m");
+    assert.equal(sessionLabelFromEnv({ AIRLOCK_SESSION_LABEL: "x".repeat(300) }).length, 120);
+  });
+
+  it("records the launcher's label in session.json", async () => {
     const sessionManager = buildSessionManager({
       tmux: new FakeShellTmux(),
       stateDirectory,
-      launcherContext: { session: "abc123", profile: "p1", studio: "grant", project: "concord" },
+      sessionLabel: "session abc123, studio grant, project concord",
     });
     await sessionManager.open("fake-shell");
     const state = JSON.parse(readFileSync(join(stateDirectory, "session.json"), "utf8"));
-    assert.equal(state.session, "abc123");
-    assert.equal(state.profile, "p1");
-    assert.equal(state.studio, "grant");
-    assert.equal(state.project, "concord");
+    assert.equal(state.label, "session abc123, studio grant, project concord");
+  });
+
+  it("still names a record written before the label existed", () => {
+    // An old session.json is a leftover too, and going anonymous would make
+    // exactly the refusal this task exists to fix useless.
+    const sessionManager = buildSessionManager({ tmux: new FakeShellTmux(), stateDirectory });
+    writeFileSync(
+      join(stateDirectory, "session.json"),
+      JSON.stringify({ target: "fake-shell", pid: 999999, session: "abc123", studio: "grant" }),
+    );
+    assert.equal(
+      sessionManager.describeRecordedLeftover(),
+      "recorded as fake-shell, session abc123, studio grant, bridge pid 999999",
+    );
   });
 
   it("names the live holder's session and studio, in local time", async () => {
