@@ -8,7 +8,6 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -22,11 +21,11 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { approvalHelperProblem, requestApproval } from "../src/approval.mjs";
-import { currentClaudeSessionTitle } from "../src/claude-session.mjs";
 import { buildApprovalHtml, highlightRuby, escapeHtml } from "../src/colorize.mjs";
 import { COMMAND_COLUMNS, CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { capOutput } from "../src/output-stream.mjs";
+import { SESSION_LABEL_ENV } from "../src/session-manager.mjs";
 import { explicitHostAliases } from "../src/ssh-config.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -88,7 +87,7 @@ describe("requestApproval", () => {
     command: "User.count",
     badge: "test",
     actionDescription: "Send?",
-    claudeSessionName: null,
+    workingDirectory: null,
     timeoutSeconds: 5,
   };
 
@@ -166,7 +165,7 @@ describe("requestApproval", () => {
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.deepEqual(Object.keys(payload).sort(), ["html", "timeoutSeconds", "title"]);
     assert.equal(payload.timeoutSeconds, 5);
-    assert.equal(payload.title, "Airlock — approval required"); // no session name known
+    assert.equal(payload.title, "Airlock — test"); // the target, for a window list
     // Colorization may span-wrap each token; assert the pieces, not the join.
     assert.match(payload.html, /User/);
     assert.match(payload.html, /where/);
@@ -192,21 +191,55 @@ describe("requestApproval", () => {
     assert.match(payload.html, /decide\("watch"\)/);
   });
 
-  it("puts the requesting Claude session name in the overlay title and header", async () => {
-    const payloadPath = join(scratch, "helper-stdin-named");
+  it("puts the directory and the purpose in the header, and the target in the title", async () => {
+    const payloadPath = join(scratch, "helper-stdin-where");
     const helper = writeFakeHelper(
-      "payload-dump-named",
+      "payload-dump-where",
       `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
     );
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      claudeSessionName: "Fix PROJ-123",
+      workingDirectory: "/srv/app",
+      purpose: "check whether the staging queue is draining",
     });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock — Fix PROJ-123");
-    assert.match(payload.html, /Fix PROJ-123/);
+    assert.equal(payload.title, "Airlock — test");
+    assert.match(payload.html, /<span class="where">\/srv\/app<\/span>/);
+    // The claim, marked as one: a quiet key, then the model's words.
+    assert.match(
+      payload.html,
+      /<div class="purpose"><span class="key">for<\/span>check whether the staging queue is draining<\/div>/,
+    );
+    // The mark: a rule in the gutter, so the claim is set off from the bytes
+    // without becoming louder than them.
+    assert.match(payload.html, /\.purpose \{[^}]*border-left: 3px solid/);
+    // The directory is the place; the action question does not repeat it.
+    assert.doesNotMatch(payload.html, /<span class="title">Send\?<\/span>/);
+  });
+
+  it("omits the purpose line when the call carries no claim", async () => {
+    const payloadPath = join(scratch, "helper-stdin-no-purpose");
+    const helper = writeFakeHelper(
+      "payload-dump-no-purpose",
+      `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+    );
+    await requestApproval({ ...approvalRequest, helperPath: helper });
+    const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+    assert.doesNotMatch(payload.html, /class="purpose"/);
+  });
+
+  it("falls back to the action question when no pane is open to ask", async () => {
+    const payloadPath = join(scratch, "helper-stdin-unlabeled");
+    const helper = writeFakeHelper(
+      "payload-dump-unlabeled",
+      `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+    );
+    await requestApproval({ ...approvalRequest, helperPath: helper });
+    const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+    assert.equal(payload.title, "Airlock — test");
+    assert.match(payload.html, /<span class="title">Send\?<\/span>/);
   });
 
   it("marks a labeled instance's overlay title and header", async () => {
@@ -218,11 +251,11 @@ describe("requestApproval", () => {
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      claudeSessionName: "Fix PROJ-123",
+      workingDirectory: "/srv/app",
       instanceLabel: "DEV",
     });
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock DEV — Fix PROJ-123");
+    assert.equal(payload.title, "Airlock DEV — test");
     assert.match(payload.html, /<span class="badge dev">DEV<\/span>\s*<span class="badge">Test<\/span>/);
   });
 
@@ -292,117 +325,6 @@ describe("approvalHelperProblem", () => {
     const helperPath = writeFakeHelper("sourceless-helper", "exit 0");
     utimesSync(helperPath, 0, 0);
     assert.equal(approvalHelperProblem({ helperPath, sourcePath: join(scratch, "no-source-here") }), null);
-  });
-});
-
-// ---- requesting-session title ----------------------------------------------
-
-describe("currentClaudeSessionTitle", () => {
-  function writeClaudeConfigDir({ hostSessionFile, registryFile } = {}) {
-    const configDir = mkdtempSync(join(scratch, "claude-config-"));
-    let hostSessionPath = null;
-    if (hostSessionFile) {
-      // The desktop store nests session files under opaque UUID directories.
-      const storeDirectory = join(configDir, "claude-code-sessions", "org-uuid", "project-uuid");
-      mkdirSync(storeDirectory, { recursive: true });
-      hostSessionPath = join(storeDirectory, hostSessionFile.name);
-      writeFileSync(hostSessionPath, hostSessionFile.content);
-    }
-    if (registryFile) {
-      const registryDirectory = join(configDir, "sessions");
-      mkdirSync(registryDirectory, { recursive: true });
-      writeFileSync(join(registryDirectory, registryFile.name), registryFile.content);
-    }
-    return { configDir, hostSessionPath };
-  }
-
-  function withSessionEnv(overrides, work) {
-    const keys = ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID"];
-    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    for (const key of keys) {
-      if (overrides[key] === undefined) delete process.env[key];
-      else process.env[key] = overrides[key];
-    }
-    try {
-      return work();
-    } finally {
-      for (const key of keys) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
-    }
-  }
-
-  it("resolves the desktop app's session title from the host-session store", () => {
-    const { configDir } = writeClaudeConfigDir({
-      hostSessionFile: {
-        name: "local_host-title.json",
-        content: JSON.stringify({ title: "Fix PROJ-123", titleSource: "auto" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-title" },
-      () => assert.equal(currentClaudeSessionTitle(), "Fix PROJ-123"),
-    );
-  });
-
-  it("re-reads the title on every call so a rename shows on the next approval", () => {
-    const { configDir, hostSessionPath } = writeClaudeConfigDir({
-      hostSessionFile: {
-        name: "local_host-rename.json",
-        content: JSON.stringify({ title: "New session" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-rename" },
-      () => {
-        assert.equal(currentClaudeSessionTitle(), "New session");
-        writeFileSync(hostSessionPath, JSON.stringify({ title: "Debug flaky specs" }));
-        assert.equal(currentClaudeSessionTitle(), "Debug flaky specs");
-      },
-    );
-  });
-
-  it("falls back to the CLI registry's agent-messaging name", () => {
-    const { configDir } = writeClaudeConfigDir({
-      registryFile: {
-        name: "12345.json",
-        content: JSON.stringify({ sessionId: "cli-session-9", name: "airlock-42" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_SESSION_ID: "cli-session-9" },
-      () => assert.equal(currentClaudeSessionTitle(), "airlock-42"),
-    );
-  });
-
-  it("returns null when the environment names no session", () => {
-    const { configDir } = writeClaudeConfigDir();
-    withSessionEnv({ CLAUDE_CONFIG_DIR: configDir }, () =>
-      assert.equal(currentClaudeSessionTitle(), null),
-    );
-  });
-
-  it("returns null when the identified session is missing from the stores", () => {
-    const { configDir } = writeClaudeConfigDir();
-    withSessionEnv(
-      {
-        CLAUDE_CONFIG_DIR: configDir,
-        CLAUDE_CODE_HOST_SESSION_ID: "local_host-absent",
-        CLAUDE_CODE_SESSION_ID: "cli-session-absent",
-      },
-      () => assert.equal(currentClaudeSessionTitle(), null),
-    );
-  });
-
-  it("returns null on a malformed store file instead of throwing", () => {
-    const { configDir } = writeClaudeConfigDir({
-      hostSessionFile: { name: "local_host-garbage.json", content: "not json at all" },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-garbage" },
-      () => assert.equal(currentClaudeSessionTitle(), null),
-    );
   });
 });
 
@@ -499,6 +421,18 @@ describe("buildApprovalHtml", () => {
     });
     assert.match(html, /<span class="badge dev">&lt;DEV&gt;<\/span>\s*<span class="badge">Test Shell<\/span>/);
     assert.match(html, /\.badge\.dev \{ background: #4b3b6b; color: #cfa8ff; \}/);
+  });
+
+  it("shows the working directory as an escaped, wrapping path in the header", async () => {
+    const html = await buildApprovalHtml({
+      command,
+      badge: "test-shell",
+      headerText: "Send?",
+      workingDirectory: "/srv/<app>&/current",
+      timeoutSeconds: 30,
+    });
+    assert.match(html, /<span class="where">\/srv\/&lt;app&gt;&amp;\/current<\/span>/);
+    assert.match(html, /\.where \{[^}]*overflow-wrap: anywhere;/);
   });
 });
 
@@ -605,16 +539,11 @@ describe("server.mjs over stdio", () => {
 
   function spawnServer(argv, env = {}) {
     const spawnEnvironment = { ...process.env, ...env };
-    // The test process itself may be running inside a Claude session; its
-    // identity must never leak into the server under test (the overlay title
-    // tests would see the REAL session's on-disk title otherwise). Nor may a
-    // variable the server refuses, left in a developer's own shell.
-    const inheritedKeys = [
-      "CLAUDE_CONFIG_DIR",
-      "CLAUDE_CODE_HOST_SESSION_ID",
-      "CLAUDE_CODE_SESSION_ID",
-      ...Object.keys(RETIRED_ENVIRONMENT_FLAGS),
-    ];
+    // The test process may itself be running inside an Airlock session, so a
+    // label in the developer's shell must never leak into the server under
+    // test (the overlay title tests would see the REAL session's label). Nor
+    // may a variable the server refuses, left in a developer's own shell.
+    const inheritedKeys = [SESSION_LABEL_ENV, ...Object.keys(RETIRED_ENVIRONMENT_FLAGS)];
     for (const key of inheritedKeys) {
       if (!(key in env)) delete spawnEnvironment[key];
     }
@@ -794,7 +723,7 @@ describe("server.mjs over stdio", () => {
 
       const noSession = await call("tools/call", {
         name: "send_terminal",
-        arguments: { command: "pwd" },
+        arguments: { command: "pwd", purpose: "find where the session starts" },
       });
       assert.equal(noSession.result.isError, true);
       assert.match(noSession.result.content[0].text, /No session is open/);
@@ -841,57 +770,35 @@ describe("server.mjs over stdio", () => {
     }
   });
 
-  it("passes clientInfo through initialize into the DEV-marked overlay title", async () => {
+  it("names the DEV-marked overlay by target, not by session or client title", async () => {
     const payloadPath = join(scratch, `e2e-payload-${Math.random().toString(36).slice(2)}`);
     const { child, call } = startServer({
       helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+      // A label is set and must NOT reach the header: it names a session, and
+      // the header answers "where", which for a person with one session per
+      // project is the directory (T3). The label's reader is the refusal.
+      env: { [SESSION_LABEL_ENV]: "session 4de569de, studio grant, project airlock" },
     });
     try {
       await call("initialize", {
         protocolVersion: "2025-06-18",
-        clientInfo: { name: "claude-code", title: "Debug PROJ-99" },
+        // A title in clientInfo is the client's own display name, not this
+        // session: two windows of one client would look identical, so the
+        // header never reads it.
+        clientInfo: { name: "claude-ai", version: "0.1.0", title: "Debug PROJ-99" },
       });
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
-      const { readFileSync } = await import("node:fs");
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock DEV — Debug PROJ-99");
+      assert.equal(payload.title, "Airlock DEV — test-shell");
       assert.match(payload.html, /<span class="badge dev">DEV<\/span>/);
-      assert.match(payload.html, /Debug PROJ-99/);
+      // No pane yet, so there is no directory to name: the question stands in.
+      assert.match(payload.html, /<span class="title">Open test-shell\?<\/span>/);
+      assert.doesNotMatch(payload.html, /session 4de569de/);
+      assert.doesNotMatch(payload.html, /Debug PROJ-99/);
+      assert.doesNotMatch(payload.html, /claude-ai/);
       // The resolved display_command (colorized: tokens may be span-wrapped).
       assert.match(payload.html, /ssh/);
       assert.match(payload.html, /testhost/);
-    } finally {
-      child.kill();
-    }
-  });
-
-  it("names the overlay from the on-disk session title, out-ranking clientInfo", async () => {
-    // The store layout Claude Code's desktop app actually writes; the ids
-    // reach the bridge through the environment it is spawned with.
-    const configDir = mkdtempSync(join(scratch, "e2e-claude-config-"));
-    const storeDirectory = join(configDir, "claude-code-sessions", "org-uuid", "project-uuid");
-    mkdirSync(storeDirectory, { recursive: true });
-    writeFileSync(
-      join(storeDirectory, "local_e2e-host.json"),
-      JSON.stringify({ title: "Investigate PROJ-500", titleSource: "auto" }),
-    );
-    const payloadPath = join(scratch, `e2e-title-payload-${Math.random().toString(36).slice(2)}`);
-    const { child, call } = startServer({
-      helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
-      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_e2e-host" },
-    });
-    try {
-      // The constant product clientInfo Claude Code really sends must never
-      // reach the header when the real session title is on disk.
-      await call("initialize", {
-        protocolVersion: "2025-06-18",
-        clientInfo: { name: "claude-ai", version: "0.1.0" },
-      });
-      await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
-      const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock DEV — Investigate PROJ-500");
-      assert.match(payload.html, /Investigate PROJ-500/);
-      assert.doesNotMatch(payload.html, /claude-ai/);
     } finally {
       child.kill();
     }
@@ -1064,17 +971,15 @@ describe("server.mjs over stdio", () => {
       assert.match(refused.result.content[0].text, /Another session's Airlock/);
       assert.ok(!existsSync(overlayMarker), "the approval overlay must not have popped");
 
-      // list_targets names the cross-session holder once its state is readable.
+      // list_targets names the cross-session holder once its state is readable,
+      // in the launcher's own words.
       writeFileSync(
         join(stateDirectory, "session.json"),
         JSON.stringify({
           target: "test-shell",
           pid: holder.pid,
           opened_at: "2026-08-23T00:00:00Z",
-          session: "abc123",
-          profile: "p1",
-          studio: "grant",
-          project: "concord",
+          label: "session abc123, studio grant, project concord",
         }),
       );
       const listed = await call("tools/call", { name: "list_targets", arguments: {} });
@@ -1083,10 +988,7 @@ describe("server.mjs over stdio", () => {
         target: "test-shell",
         opened_at: "2026-08-23T00:00:00Z",
         bridge_pid: holder.pid,
-        session: "abc123",
-        profile: "p1",
-        studio: "grant",
-        project: "concord",
+        label: "session abc123, studio grant, project concord",
       });
     } finally {
       holder.kill("SIGKILL");
@@ -1211,16 +1113,86 @@ describe("server.mjs over stdio", () => {
 
       const wideCommand = `echo ${"a".repeat(115)}`;
       assert.equal(wideCommand.length, 120);
-      const rejected = await call("tools/call", { name: "send_terminal", arguments: { command: wideCommand } });
+      const rejected = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: wideCommand, purpose: "prove a wide line never reaches the human" },
+      });
       assert.equal(rejected.result.isError, true);
       assert.match(rejected.result.content[0].text, /^send_terminal rejected before approval/);
       assert.match(rejected.result.content[0].text, /line 1, col 81: \[width\] 120 columns; the limit is 80/);
       assert.equal(overlayCount(), 1, "the approval overlay must not have popped");
 
-      const sent = await call("tools/call", { name: "send_terminal", arguments: { command: "echo hello\n" } });
+      const sent = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hello\n", purpose: "prove a well-formed send still goes through" },
+      });
       assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
       assert.match(sent.result.content[0].text, /hello/);
       assert.equal(overlayCount(), 2);
+
+      await call("tools/call", { name: "close_terminal", arguments: {} });
+    } finally {
+      spawnSync(tmuxBinaryForTests(), ["-S", join(stateDirectory, "tmux.sock"), "kill-server"]);
+      child.kill();
+    }
+  });
+
+  it("requires a purpose line, and shows it above the command", async () => {
+    const payloadPath = join(scratch, `e2e-purpose-${Math.random().toString(36).slice(2)}`);
+    const localShellPath = writeFakeHelper(
+      `purpose-shell-${Math.random().toString(36).slice(2)}`,
+      "exec /usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile",
+    );
+    const configPath = writeBridgeConfig({
+      targets: {
+        "local-shell": {
+          description: "Local bash standing in for a remote shell",
+          display_command: localShellPath,
+          transport: "script",
+          script: localShellPath,
+          driver: "shell",
+        },
+      },
+    });
+    const { child, call, stateDirectory } = startServer({
+      helperScript: `cat > ${payloadPath}; printf '{"decision":"approve"}'`,
+      configPath,
+    });
+    try {
+      await call("initialize", { protocolVersion: "2025-06-18" });
+      const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
+      assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+      // The model cannot see the overlay, and a pane's directory comes from the
+      // tmux server rather than the target, so the open result names it.
+      assert.match(opened.result.content[0].text, /\n\n\(where: \/[^)]+\)$/);
+
+      // Missing: the tool schema requires it, and the bridge says so without
+      // popping the overlay.
+      const missing = await call("tools/call", { name: "send_terminal", arguments: { command: "echo hi\n" } });
+      assert.equal(missing.result.isError, true);
+      assert.match(missing.result.content[0].text, /`purpose` is required/);
+
+      const tooLong = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hi\n", purpose: "x".repeat(101) },
+      });
+      assert.equal(tooLong.result.isError, true);
+      assert.match(tooLong.result.content[0].text, /101 characters; the limit is 100/);
+
+      const purpose = "check whether the queue is draining";
+      const sent = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hi\n", purpose },
+      });
+      assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
+      // The result names the same directory the human was shown, so a command
+      // that ran somewhere unexpected cannot look like one that did not.
+      assert.match(sent.result.content[0].text, /\n\n\(where: \/[^)]+\)/);
+      const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+      // The claim, marked as a claim, above the bytes; the directory beside it
+      // is the observed fact it is not.
+      assert.match(payload.html, new RegExp(`<div class="purpose"><span class="key">for</span>${purpose}</div>`));
+      assert.match(payload.html, /<span class="where">/);
 
       await call("tools/call", { name: "close_terminal", arguments: {} });
     } finally {

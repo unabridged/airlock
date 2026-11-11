@@ -82,24 +82,45 @@ function humanizeBadge(badge) {
 
 // The pill naming a non-production instance, ahead of the target badge so a
 // development panel is never mistaken for the production gate.
+// The header's last slot. The directory, when a pane is open to ask: a person
+// with one session per project knows their sessions by the directory they are
+// in, not by a session id. Without a pane there is nothing honest to show
+// about where, so the action question stands in.
+function whereSpan(workingDirectory, headerText) {
+  if (workingDirectory) return `<span class="where">${escapeHtml(workingDirectory)}</span>`;
+  return `<span class="title">${escapeHtml(headerText)}</span>`;
+}
+
+// The line under the header: the model's claim about why this call exists.
+// It reads as a claim on purpose -- a quiet `for` ahead of it, and the words in
+// italic -- because the directory above is a fact the bridge observed and this
+// is not. A person deciding needs to be able to tell those apart at a glance.
+function purposeLine(purpose) {
+  if (!purpose) return "";
+  return `<div class="purpose"><span class="key">for</span>${escapeHtml(purpose)}</div>`;
+}
+
 function instanceLabelPill(instanceLabel) {
   if (!instanceLabel) return "";
   return `<span class="badge dev">${escapeHtml(instanceLabel)}</span>`;
 }
 
 // The approval page: a header row (the instance pill of a non-production
-// instance, the target badge, and the requesting Claude Code session name or
-// the action question) above the colorized command, above a footer the
-// page owns — a note slot that the helper's native text field overlays
-// (WKWebView inputs cannot take dictation or paste in a non-activating
-// panel), a Deny button carrying the auto-deny countdown, and a split
-// Approve button whose 👀 segment also opens the terminal on the session.
-// All decisions post through {window.webkit.messageHandlers.decision}.
+// instance, the target badge, and the directory an approved command would
+// run in — or the action question, when there is no pane to ask) above the
+// colorized command, above a footer the page owns — a note slot that the
+// helper's native text field overlays (WKWebView inputs cannot take
+// dictation or paste in a non-activating panel), a Deny button carrying the
+// auto-deny countdown, and a split Approve button whose 👀 segment also opens
+// the terminal on the session. All decisions post through
+// {window.webkit.messageHandlers.decision}.
 export async function buildApprovalHtml({
   command,
   badge,
   instanceLabel = null,
   headerText,
+  workingDirectory = null,
+  purpose = null,
   timeoutSeconds,
 }) {
   const lines = (await highlightRuby(command)).split("\n");
@@ -138,9 +159,23 @@ export async function buildApprovalHtml({
   /* The header doubles as the window's drag strip — unselectable, so WebKit
      passes its mouse-downs through to AppKit instead of starting a text
      selection. */
-  .head { display: flex; align-items: center; gap: 12px; padding: 18px;
+  .head { display: flex; flex-direction: column; gap: 10px; padding: 18px;
           font-family: -apple-system, system-ui, sans-serif;
           -webkit-user-select: none; user-select: none; }
+  .headline { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  /* The requester's claim, not the bridge's observation: italic, and marked
+     with a quiet key so it is never mistaken for the path above it. */
+  .purpose { color: #c8cde0; font-size: 17px; font-style: italic;
+             overflow-wrap: anywhere;
+             /* Structure, not brightness: the italic says "a claim", the rule
+                says "this belongs to the command below it". The negative
+                margin puts the text back on the same edge as the path above,
+                so the rule sits in the gutter instead of indenting the line. */
+             border-left: 3px solid rgba(238, 240, 249, 0.28);
+             padding-left: 10px; margin-left: -13px; }
+  .purpose .key { color: #7d84a0; font-style: normal; font-size: 12px;
+                  letter-spacing: 0.12em; text-transform: uppercase;
+                  margin-right: 10px; }
   /* ui-rounded resolves to SF Pro Rounded inside WKWebView. */
   .badge { background: #454a59; color: #54b9ff; border-radius: 999px;
            padding: 4px 14px; font: 600 17px/1.5 ui-rounded, -apple-system,
@@ -152,6 +187,12 @@ export async function buildApprovalHtml({
   /* A development instance's pill: purple, a tint no target badge uses. */
   .badge.dev { background: #4b3b6b; color: #cfa8ff; }
   .title { color: #d6d9e9; font-size: 18px; font-weight: 510; }
+  /* Where the command would run. A path is not prose: it renders in the
+     command's own face, muted, so it reads as the place rather than as one
+     more sentence to parse. Wraps rather than clipping — the tail of a path
+     is the part that names it. */
+  .where { color: #9aa3bb; font: 400 16px/1.5 Menlo, monospace;
+           overflow-wrap: anywhere; min-width: 0; }
   /* The code block is a positioning context for the more-lines badge. */
   .code { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
   pre { margin: 0; padding: 0 0 5px; overflow: auto; flex: 1 1 auto; min-height: 0; }
@@ -232,9 +273,12 @@ export async function buildApprovalHtml({
   .glyph { flex: none; }
   button.eyes .glyph { font-size: 17px; line-height: 1; text-shadow: none; }
 </style></head><body>
-  <div class="head">${instanceLabelPill(instanceLabel)}
-    <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
-    <span class="title">${escapeHtml(headerText)}</span>
+  <div class="head">
+    <div class="headline">${instanceLabelPill(instanceLabel)}
+      <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
+      ${whereSpan(workingDirectory, headerText)}
+    </div>
+    ${purposeLine(purpose)}
   </div>
   <div class="code"><pre>${rows}</pre><span id="more-lines" hidden></span></div>
   <div class="foot">

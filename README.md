@@ -46,13 +46,58 @@ Agent sees six tools:
 | `list_targets` | none | Lists the configured targets (name, description, the exact command an open would run), and which session holds the one open session. |
 | `open_terminal` | overlay | Starts the session for one target: `ssh <alias>`, then the target's startup lines (e.g. `bin/rails console`). |
 | `open_terminal` with `adopt: true` | overlay | Takes over the pane an earlier bridge left running, under the target the state file recorded. Nothing is started; a Rails console gets one idempotent line (the pager-disable check that proves it is IRB). |
-| `send_terminal` | overlay | Types one command into the session and returns the captured output. |
+| `send_terminal` | overlay | Types one command into the session and returns the captured output. Every call carries a required `purpose`: one line saying what the command is for, shown to the human above it. |
 | `interrupt_terminal` | overlay | Sends a real Ctrl-C to the running command. |
 | `close_terminal` | none | Exits the remote program and tears the session down. |
 | `clear_terminal` | overlay | Ends the pane an earlier bridge left running, when the human says it is dead. Never automatic, and never while another live bridge holds it. |
 
 Deny can carry a feedback note, which rides back to the agent so it can adjust 
 and resend.
+
+**Naming the holder.** A refusal says which session holds the gate, and it can
+only say what the launcher tells it. If the launcher sets
+`AIRLOCK_SESSION_LABEL` — one plain, non-secret line, such as
+`session 4de569de, studio grant, project concord` — that is what a refusal and
+`list_targets` show. A client that starts the server itself sets it the same
+way, in the server's `env` block:
+
+```json
+"airlock": {
+  "command": "…",
+  "env": { "AIRLOCK_SESSION_LABEL": "staging console — deploy check" }
+}
+```
+
+The MCP client's own name is not enough: it identifies the product (`claude-ai`,
+`pi`), not the session, so two windows of the same client look identical in a
+refusal. The label is what makes the holder findable. It is one generic variable
+rather than any one launcher's set, so a session started by any harness can name
+itself; without it the record still carries the MCP client, the bridge pid, and
+the open time, and an older `session.json` is still described from its own
+fields.
+
+**What the overlay shows:** the target, the directory the pane is in right now,
+and the agent's one-line `purpose` for the command — then the command itself,
+verbatim. The directory is a fact the bridge observes; the purpose is the
+agent's own claim about why it is running this, and it is marked as a claim. A
+command with no pane yet (an open) shows the action question instead of a
+directory, and no purpose: those calls carry none.
+
+**Purpose line:** `send_terminal` requires one. It is the one rule here that is
+not mechanical: the command rules are constraints the tool can refuse, while
+"what is this for" has no parser, so a purpose is a promise the agent makes to
+the person and is checked by the person's eye rather than by a rejection. The
+overlay's job is not to verify that promise but to put it where it can be held
+to — beside the command, under the directory, so the claim and the bytes are
+read together. It is one line, at most 100 characters, with the same character
+rules as the command, and it is checked before the overlay pops: a missing,
+paragraph-length, over-long, or unrenderable purpose is rejected with the
+problems listed, and the human never sees the call.
+
+The order of composition matters and cannot be checked. Deciding what a call is
+for before writing the command is the discipline; a purpose written afterwards
+describes what was typed rather than what was wanted. The practical tell, from
+a session that used it: a purpose that needs an `and` is two calls.
 
 **Style contract:** `send_terminal` checks every command against a style
 contract before the overlay pops, so the human only reviews text they can read
