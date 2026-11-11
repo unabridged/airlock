@@ -347,8 +347,8 @@ floating native panel:
 - `collectionBehavior: [.canJoinAllSpaces, .fullScreenAuxiliary]` + elevated
   window level: visible **over full-screen apps**.
 - Content: a `WKWebView` displaying bridge-generated HTML — a header row
-  (Airlock session badge, the requesting **Claude Code session's name** when
-  known, falling back to the action question, and the auto-deny countdown)
+  (Airlock session badge, the requesting session's **label** as its launcher
+  set it, falling back to the action question, and the auto-deny countdown)
   above the colorized command — plus native **Approve / Deny** buttons.
 - Typography matches the user's VS Code editor so the command reads like
   their own code: Monaco at the effective zoomed size (`editor.fontSize` ×

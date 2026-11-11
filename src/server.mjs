@@ -21,7 +21,6 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { approvalHelperProblem, requestApproval } from "./approval.mjs";
-import { currentClaudeSessionTitle } from "./claude-session.mjs";
 import {
   checkCommandContract,
   CONTRACT_SPEC_TEXT,
@@ -98,11 +97,6 @@ const sessionManager = new SessionManager({
 // misconfiguration should be named at registration time, not mid-workflow.
 const helperProblem = approvalHelperProblem({ helperPath: launchOptions.approvalHelperPath });
 if (helperProblem) log(`warning: ${helperProblem}`);
-
-// Fallback identity for the overlay header, learned from initialize
-// (clientInfo.title) — outranked per-approval by the on-disk session title
-// ({currentClaudeSessionTitle}), outranking the per-action question.
-let claudeSessionName = null;
 
 // ---- tool definitions, generated from config so they cannot drift ---------
 
@@ -239,13 +233,12 @@ function handleInitialize(id, params) {
 
   const clientInfo = params && params.clientInfo;
   if (clientInfo) {
-    // Only the display-intended title is worth keeping. clientInfo.name is a
-    // constant product identifier ("claude-ai") that would displace the far
-    // more useful per-action question in the overlay header.
-    claudeSessionName = (typeof clientInfo.title === "string" && clientInfo.title) || null;
-    // The name and version DO belong in the session state file: a later
+    // The client's name and version belong in the session state file: a later
     // session that finds this one's pane still running needs to say who left
-    // it there.
+    // it there. They do not belong in the overlay header — the name is a
+    // constant product identifier, identical in two windows of one client, so
+    // it cannot answer "which session is asking". The launcher's own label
+    // does that, and it is the only identity the header uses.
     sessionManager.noteClient(clientInfo);
   }
 
@@ -284,10 +277,12 @@ async function approveOrExplain({ command, badge, actionDescription }) {
     command,
     badge,
     actionDescription,
-    // The on-disk session title is resolved fresh per approval — the app
-    // auto-titles a session a few exchanges in, and the human can rename it
-    // at any time — with anything learned from initialize as the fallback.
-    claudeSessionName: currentClaudeSessionTitle() || claudeSessionName,
+    // Who is asking, in the launcher's own words (AIRLOCK_SESSION_LABEL, the
+    // same line a leftover refusal names). Read from the environment once at
+    // startup, so it is the same line for every approval this session raises.
+    // Null when the launcher set no label; the header then falls back to the
+    // per-action question, which is all it can honestly say.
+    sessionLabel: sessionManager.sessionLabel,
     timeoutSeconds: config.overlay_timeout_seconds,
     // The overlay's 👀 button approves AND opens the terminal on the session
     // by handing this script to /usr/bin/open.
