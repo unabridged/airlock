@@ -920,6 +920,9 @@ describe("SessionManager — liveness probes and teardown safety", () => {
     assert.equal(existsSync(join(stateDirectory, "session.json")), false);
     // And the next call says what happened, rather than "no session is open".
     await assert.rejects(sessionManager.send("pwd"), /fake-shell session has ended/);
+    // Once. After that the plain refusal returns, so a bridge does not keep
+    // announcing a death from hours ago.
+    await assert.rejects(sessionManager.send("pwd"), /No session is open/);
   });
 
   it("reaps on the timer, within the interval, without anyone asking", async () => {

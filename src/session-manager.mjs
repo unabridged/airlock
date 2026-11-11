@@ -829,14 +829,18 @@ export class SessionManager {
   }
 
   requireOpenSession() {
-    if (!this.activeSession) {
-      // A session the probe reaped gets to say so once; a session that was
-      // never opened, or was closed on purpose, gets the plain refusal.
-      throw new SessionStateError(
-        this.reapedSession ?? `No session is open. Use open_terminal first.`,
-      );
-    }
+    if (!this.activeSession) throw new SessionStateError(this.noSessionRefusal());
     return this.activeSession;
+  }
+
+  // The refusal for a call with no session. A session the probe reaped says
+  // what happened -- once. After that the plain refusal returns, so a bridge
+  // does not keep announcing a death from hours ago. The server's handlers
+  // call this directly too: they refuse before reaching requireOpenSession.
+  noSessionRefusal() {
+    const reaped = this.reapedSession;
+    this.reapedSession = null;
+    return reaped ?? `No session is open. Use open_terminal first.`;
   }
 
   // The release that does not need a caller (T11). A live bridge whose pane is
