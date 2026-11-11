@@ -1159,6 +1159,9 @@ describe("server.mjs over stdio", () => {
       await call("initialize", { protocolVersion: "2025-06-18" });
       const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
       assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+      // The model cannot see the overlay, and a pane's directory comes from the
+      // tmux server rather than the target, so the open result names it.
+      assert.match(opened.result.content[0].text, /\n\n\(where: \/[^)]+\)$/);
 
       // Missing: the tool schema requires it, and the bridge says so without
       // popping the overlay.
@@ -1179,6 +1182,9 @@ describe("server.mjs over stdio", () => {
         arguments: { command: "echo hi\n", purpose },
       });
       assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
+      // The result names the same directory the human was shown, so a command
+      // that ran somewhere unexpected cannot look like one that did not.
+      assert.match(sent.result.content[0].text, /\n\n\(where: \/[^)]+\)/);
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
       // The claim, marked as a claim, above the bytes; the directory beside it
       // is the observed fact it is not.

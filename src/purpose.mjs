@@ -8,9 +8,21 @@
 // worse than no claim, and one that cannot be checked against the command is
 // only decoration.
 //
-// Required, not optional: the gate is a commitment surface. A sentence the
-// model must write before the human decides costs it something, and a claim
-// made in front of the person approving is one they can hold against the bytes.
+// Required, not optional, and deliberately not mechanical. The command rules
+// in command-contract.mjs are *constraints*: the tool refuses a line that is
+// too wide, and needs no trust to do it. A purpose has no parser -- "what is
+// this for" cannot be rejected mechanically -- so it is the other kind of rule:
+// a *promise the model makes to the person*, enforced by the person's eye
+// rather than by a rejection. That is still a commitment; what it lacks is
+// enforcement, and that is what the gate is for.
+//
+// The order matters and cannot be checked. Deciding what a call is for before
+// composing the command is the discipline; a purpose composed afterwards
+// describes what was typed rather than what was wanted, and the tool cannot
+// tell the two apart -- only the person reading the claim beside the bytes can.
+// So the overlay's job is not to verify the promise, it is to put the promise
+// where it can be held to. The practical tell, from a session that used it:
+// a purpose that needs an "and" is a call doing two things.
 
 import { characterViolations, formatViolations } from "./command-contract.mjs";
 

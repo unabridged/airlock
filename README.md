@@ -83,13 +83,21 @@ agent's own claim about why it is running this, and it is marked as a claim. A
 command with no pane yet (an open) shows the action question instead of a
 directory, and no purpose: those calls carry none.
 
-**Purpose line:** `send_terminal` requires one, because the gate is a
-commitment surface — a sentence the agent must write before the human decides
-costs it something, and a claim made in front of the person approving is one
-they can hold against the bytes. It is one line, at most 100 characters, with
-the same character rules as the command, and it is checked before the overlay
-pops. A missing, paragraph-length, over-long, or unrenderable purpose is
-rejected with the problems listed, and the human never sees the call.
+**Purpose line:** `send_terminal` requires one. It is the one rule here that is
+not mechanical: the command rules are constraints the tool can refuse, while
+"what is this for" has no parser, so a purpose is a promise the agent makes to
+the person and is checked by the person's eye rather than by a rejection. The
+overlay's job is not to verify that promise but to put it where it can be held
+to — beside the command, under the directory, so the claim and the bytes are
+read together. It is one line, at most 100 characters, with the same character
+rules as the command, and it is checked before the overlay pops: a missing,
+paragraph-length, over-long, or unrenderable purpose is rejected with the
+problems listed, and the human never sees the call.
+
+The order of composition matters and cannot be checked. Deciding what a call is
+for before writing the command is the discipline; a purpose written afterwards
+describes what was typed rather than what was wanted. The practical tell, from
+a session that used it: a purpose that needs an `and` is two calls.
 
 **Style contract:** `send_terminal` checks every command against a style
 contract before the overlay pops, so the human only reviews text they can read
