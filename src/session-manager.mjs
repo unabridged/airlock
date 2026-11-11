@@ -563,6 +563,21 @@ export class SessionManager {
     );
   }
 
+  // The directory the open pane is in, for the approval header: an approved
+  // command runs there, and a person tells their sessions apart by project
+  // and directory rather than by session id (T3). Best-effort by the same
+  // contract as {leftoverPaneTail}: an approval must never fail because the
+  // header could not be filled in, and a bridge with no session has nothing
+  // to report.
+  async paneWorkingDirectory() {
+    if (!this.activeSession) return null;
+    try {
+      return await this.tmux.paneCurrentPath();
+    } catch {
+      return null;
+    }
+  }
+
   // The last few lines of the leftover pane, for the adopt overlay: the one
   // piece of evidence a person has that the pane is what the record claims.
   // Visible text only (capture-pane without -e), control characters dropped,

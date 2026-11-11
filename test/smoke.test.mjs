@@ -87,7 +87,7 @@ describe("requestApproval", () => {
     command: "User.count",
     badge: "test",
     actionDescription: "Send?",
-    sessionLabel: null,
+    workingDirectory: null,
     timeoutSeconds: 5,
   };
 
@@ -165,7 +165,7 @@ describe("requestApproval", () => {
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.deepEqual(Object.keys(payload).sort(), ["html", "timeoutSeconds", "title"]);
     assert.equal(payload.timeoutSeconds, 5);
-    assert.equal(payload.title, "Airlock — approval required"); // no session name known
+    assert.equal(payload.title, "Airlock — test"); // the target, for a window list
     // Colorization may span-wrap each token; assert the pieces, not the join.
     assert.match(payload.html, /User/);
     assert.match(payload.html, /where/);
@@ -191,24 +191,26 @@ describe("requestApproval", () => {
     assert.match(payload.html, /decide\("watch"\)/);
   });
 
-  it("puts the launcher's session label in the overlay title and header", async () => {
-    const payloadPath = join(scratch, "helper-stdin-named");
+  it("puts the pane's working directory in the header, and the target in the title", async () => {
+    const payloadPath = join(scratch, "helper-stdin-where");
     const helper = writeFakeHelper(
-      "payload-dump-named",
+      "payload-dump-where",
       `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
     );
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      sessionLabel: "session 4de569de, studio grant, project airlock",
+      workingDirectory: "/srv/app",
     });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock — session 4de569de, studio grant, project airlock");
-    assert.match(payload.html, /session 4de569de, studio grant, project airlock/);
+    assert.equal(payload.title, "Airlock — test");
+    assert.match(payload.html, /<span class="where">\/srv\/app<\/span>/);
+    // The directory is the place; the action question does not repeat it.
+    assert.doesNotMatch(payload.html, /<span class="title">Send\?<\/span>/);
   });
 
-  it("falls back to the action question when the launcher named no session", async () => {
+  it("falls back to the action question when no pane is open to ask", async () => {
     const payloadPath = join(scratch, "helper-stdin-unlabeled");
     const helper = writeFakeHelper(
       "payload-dump-unlabeled",
@@ -216,7 +218,7 @@ describe("requestApproval", () => {
     );
     await requestApproval({ ...approvalRequest, helperPath: helper });
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock — approval required");
+    assert.equal(payload.title, "Airlock — test");
     assert.match(payload.html, /<span class="title">Send\?<\/span>/);
   });
 
@@ -229,11 +231,11 @@ describe("requestApproval", () => {
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      sessionLabel: "session 4de569de, studio grant",
+      workingDirectory: "/srv/app",
       instanceLabel: "DEV",
     });
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock DEV — session 4de569de, studio grant");
+    assert.equal(payload.title, "Airlock DEV — test");
     assert.match(payload.html, /<span class="badge dev">DEV<\/span>\s*<span class="badge">Test<\/span>/);
   });
 
@@ -399,6 +401,18 @@ describe("buildApprovalHtml", () => {
     });
     assert.match(html, /<span class="badge dev">&lt;DEV&gt;<\/span>\s*<span class="badge">Test Shell<\/span>/);
     assert.match(html, /\.badge\.dev \{ background: #4b3b6b; color: #cfa8ff; \}/);
+  });
+
+  it("shows the working directory as an escaped, wrapping path in the header", async () => {
+    const html = await buildApprovalHtml({
+      command,
+      badge: "test-shell",
+      headerText: "Send?",
+      workingDirectory: "/srv/<app>&/current",
+      timeoutSeconds: 30,
+    });
+    assert.match(html, /<span class="where">\/srv\/&lt;app&gt;&amp;\/current<\/span>/);
+    assert.match(html, /\.where \{[^}]*overflow-wrap: anywhere;/);
   });
 });
 
@@ -736,12 +750,14 @@ describe("server.mjs over stdio", () => {
     }
   });
 
-  it("names the DEV-marked overlay from the launcher's session label", async () => {
-    const label = "session 4de569de, studio grant, project airlock";
+  it("names the DEV-marked overlay by target, not by session or client title", async () => {
     const payloadPath = join(scratch, `e2e-payload-${Math.random().toString(36).slice(2)}`);
     const { child, call } = startServer({
       helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
-      env: { [SESSION_LABEL_ENV]: label },
+      // A label is set and must NOT reach the header: it names a session, and
+      // the header answers "where", which for a person with one session per
+      // project is the directory (T3). The label's reader is the refusal.
+      env: { [SESSION_LABEL_ENV]: "session 4de569de, studio grant, project airlock" },
     });
     try {
       await call("initialize", {
@@ -753,34 +769,16 @@ describe("server.mjs over stdio", () => {
       });
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, `Airlock DEV — ${label}`);
+      assert.equal(payload.title, "Airlock DEV — test-shell");
       assert.match(payload.html, /<span class="badge dev">DEV<\/span>/);
-      assert.match(payload.html, /session 4de569de, studio grant, project airlock/);
+      // No pane yet, so there is no directory to name: the question stands in.
+      assert.match(payload.html, /<span class="title">Open test-shell\?<\/span>/);
+      assert.doesNotMatch(payload.html, /session 4de569de/);
       assert.doesNotMatch(payload.html, /Debug PROJ-99/);
       assert.doesNotMatch(payload.html, /claude-ai/);
       // The resolved display_command (colorized: tokens may be span-wrapped).
       assert.match(payload.html, /ssh/);
       assert.match(payload.html, /testhost/);
-    } finally {
-      child.kill();
-    }
-  });
-
-  it("falls back to the action question when the launcher set no label", async () => {
-    const payloadPath = join(scratch, `e2e-unlabeled-payload-${Math.random().toString(36).slice(2)}`);
-    const { child, call } = startServer({
-      helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
-    });
-    try {
-      await call("initialize", {
-        protocolVersion: "2025-06-18",
-        clientInfo: { name: "claude-ai", version: "0.1.0", title: "Debug PROJ-99" },
-      });
-      await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
-      const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock DEV — approval required");
-      assert.match(payload.html, /<span class="title">Open test-shell\?<\/span>/);
-      assert.doesNotMatch(payload.html, /Debug PROJ-99/);
     } finally {
       child.kill();
     }

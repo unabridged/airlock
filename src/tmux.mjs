@@ -372,6 +372,14 @@ export class Tmux {
     return stdout.replace(/\n$/, "");
   }
 
+  // The directory the pane is in right now — for a local shell the working
+  // directory, for SSH the directory on the far host. This is the "where" a
+  // person reads before approving: the same fact their terminal prompt shows.
+  async paneCurrentPath() {
+    const path = (await this.displayMessage("#{pane_current_path}")).trim();
+    return path === "" ? null : path;
+  }
+
   async cursorAndScreenState() {
     // Comma-separated: display-message sanitizes control characters (a tab
     // separator comes back as "_", silently breaking the split).

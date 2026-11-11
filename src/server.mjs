@@ -277,12 +277,12 @@ async function approveOrExplain({ command, badge, actionDescription }) {
     command,
     badge,
     actionDescription,
-    // Who is asking, in the launcher's own words (AIRLOCK_SESSION_LABEL, the
-    // same line a leftover refusal names). Read from the environment once at
-    // startup, so it is the same line for every approval this session raises.
-    // Null when the launcher set no label; the header then falls back to the
-    // per-action question, which is all it can honestly say.
-    sessionLabel: sessionManager.sessionLabel,
+    // Where an approved command would run: the pane's directory right now.
+    // Not the launcher's label — a person with one session per project reads
+    // the directory, not a session id, and the label's job is the leftover
+    // refusal's sentence (T3). Null when no pane is open yet; the header then
+    // falls back to the per-action question.
+    workingDirectory: await sessionManager.paneWorkingDirectory(),
     timeoutSeconds: config.overlay_timeout_seconds,
     // The overlay's 👀 button approves AND opens the terminal on the session
     // by handing this script to /usr/bin/open.
