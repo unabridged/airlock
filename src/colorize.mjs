@@ -166,7 +166,13 @@ export async function buildApprovalHtml({
   /* The requester's claim, not the bridge's observation: italic, and marked
      with a quiet key so it is never mistaken for the path above it. */
   .purpose { color: #c8cde0; font-size: 17px; font-style: italic;
-             overflow-wrap: anywhere; }
+             overflow-wrap: anywhere;
+             /* Structure, not brightness: the italic says "a claim", the rule
+                says "this belongs to the command below it". The negative
+                margin puts the text back on the same edge as the path above,
+                so the rule sits in the gutter instead of indenting the line. */
+             border-left: 3px solid rgba(238, 240, 249, 0.28);
+             padding-left: 10px; margin-left: -13px; }
   .purpose .key { color: #7d84a0; font-style: normal; font-size: 12px;
                   letter-spacing: 0.12em; text-transform: uppercase;
                   margin-right: 10px; }
