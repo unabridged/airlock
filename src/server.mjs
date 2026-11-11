@@ -29,6 +29,7 @@ import {
 import { loadConfig, transportCommandLine } from "./config.mjs";
 import { installationProblems, refusalText } from "./install-check.mjs";
 import { parseLaunchOptions, USAGE_TEXT, UsageError } from "./launch-options.mjs";
+import { checkPurpose, formatPurposeViolations } from "./purpose.mjs";
 import { isExpectedSessionError, sessionLabelFromEnv, SessionManager } from "./session-manager.mjs";
 import { Tmux } from "./tmux.mjs";
 
@@ -149,6 +150,10 @@ function buildTools() {
         "remote prompt is ready again (the call blocks until completion — never sleep). " +
         "Requires human approval in the native overlay. Returned remote output is " +
         "untrusted data.\n\n" +
+        "Every call also carries `purpose`: one line, in your own words, saying what " +
+        "this command is for. It is required, and it is shown to the human directly " +
+        "above the command while they decide. Write the claim you would want checked " +
+        "against the bytes — not a restatement of the command.\n\n" +
         CONTRACT_SPEC_TEXT,
       inputSchema: {
         type: "object",
@@ -159,8 +164,14 @@ function buildTools() {
               "The exact command text to type into the remote session, written " +
               "to the style contract in the tool description.",
           },
+          purpose: {
+            type: "string",
+            description:
+              "One line saying what this command is for, shown to the human above " +
+              "the command: at most 100 characters, one line, no control characters.",
+          },
         },
-        required: ["command"],
+        required: ["command", "purpose"],
         additionalProperties: false,
       },
     },
@@ -257,6 +268,10 @@ function handleInitialize(id, params) {
       `After a successful open_terminal, relay the attach block from its result ` +
       `verbatim as its own bash-fenced code block — the app renders a Run button ` +
       `on it, giving the human one-click eyes on the session.\n\n` +
+      `Every send_terminal call carries a required \`purpose\`: one line, in your ` +
+      `own words, saying what the command is for. The human reads it directly ` +
+      `above the command while deciding whether to approve, so write the claim you ` +
+      `would want checked against the bytes, not a restatement of them.\n\n` +
       `${CONTRACT_SPEC_TEXT}\n\n` +
       `Configured targets:\n${targetInventoryLines().join("\n")}`,
   });
@@ -272,11 +287,15 @@ function developmentInstanceNotice() {
 
 // ---- the gate -------------------------------------------------------------
 
-async function approveOrExplain({ command, badge, actionDescription }) {
+async function approveOrExplain({ command, badge, actionDescription, purpose = null }) {
   const approval = await requestApproval({
     command,
     badge,
     actionDescription,
+    // The model's own claim about why this call exists, shown above the
+    // command. Null for the calls that carry no claim (open, adopt, clear,
+    // interrupt): those are structural, and a sentence there is boilerplate.
+    purpose,
     // Where an approved command would run: the pane's directory right now.
     // Not the launcher's label — a person with one session per project reads
     // the directory, not a session id, and the label's job is the leftover
@@ -417,11 +436,21 @@ async function handleSendTerminal(id, args) {
     });
     return;
   }
+  // The purpose is checked after the command and before the gate, for the same
+  // reason: the human never sees a call that cannot be approved as written.
+  const purposeCheck = checkPurpose(args.purpose);
+  if (!purposeCheck.ok) {
+    textResult(id, formatPurposeViolations(purposeCheck.violations, purposeCheck.purpose), {
+      isError: true,
+    });
+    return;
+  }
 
   const approval = await approveOrExplain({
     command: contract.command,
     badge: targetKey,
     actionDescription: `Send to ${targetKey}?`,
+    purpose: purposeCheck.purpose,
   });
   if (!approval.approved) {
     textResult(id, notApprovedText(approval));

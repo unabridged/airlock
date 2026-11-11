@@ -459,19 +459,31 @@ function formatViolation({ line, column, rule, message }, lines) {
   return `  - ${where}: [${rule}] ${message}\n      ${JSON.stringify(excerpt)}`;
 }
 
-// The tool result for a rejected command: every violation (capped), each
-// with its line excerpt, ending in the instruction that keeps the model from
-// retrying unchanged or looping on a rule it cannot satisfy.
-export function formatContractViolations(violations, lines) {
+// The tool result for a rejected input: every violation (capped), each with
+// its line excerpt, ending in the instruction that keeps the model from
+// retrying unchanged or looping on a rule it cannot satisfy. `headline` says
+// which input was rejected and why, so the command contract and the purpose
+// line share one shape.
+export function formatViolations(violations, lines, headline) {
   const count = violations.length;
   const listed = violations.slice(0, MAX_LISTED_VIOLATIONS).map((violation) => formatViolation(violation, lines));
   const more = count > MAX_LISTED_VIOLATIONS ? [`  … and ${count - MAX_LISTED_VIOLATIONS} more`] : [];
   return [
-    `send_terminal rejected before approval: the command breaks the style contract ` +
-      `(${count} problem${count === 1 ? "" : "s"}). The human has NOT seen it.`,
+    headline(count),
     ...listed,
     ...more,
     "Fix every item and resend the whole command. If an item cannot be satisfied " +
       "for this command, stop and relay this message to the human instead of retrying.",
   ].join("\n");
+}
+
+// The tool result for a rejected command.
+export function formatContractViolations(violations, lines) {
+  return formatViolations(
+    violations,
+    lines,
+    (count) =>
+      `send_terminal rejected before approval: the command breaks the style contract ` +
+      `(${count} problem${count === 1 ? "" : "s"}). The human has NOT seen it.`,
+  );
 }

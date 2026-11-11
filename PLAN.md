@@ -346,10 +346,11 @@ floating native panel:
   exits). Drags by the footer background.
 - `collectionBehavior: [.canJoinAllSpaces, .fullScreenAuxiliary]` + elevated
   window level: visible **over full-screen apps**.
-- Content: a `WKWebView` displaying bridge-generated HTML — a header row
-  (Airlock session badge, the requesting session's **label** as its launcher
-  set it, falling back to the action question, and the auto-deny countdown)
-  above the colorized command — plus native **Approve / Deny** buttons.
+- Content: a `WKWebView` displaying bridge-generated HTML — a header (the
+  instance pill, the target badge, and the pane's **working directory**, or the
+  action question when no pane is open), the model's one-line **purpose** marked
+  as a claim, then the colorized command — plus native **Approve / Deny**
+  buttons and the auto-deny countdown in the footer.
 - Typography matches the user's VS Code editor so the command reads like
   their own code: Monaco at the effective zoomed size (`editor.fontSize` ×
   1.2^`window.zoomLevel` ≈ 22px) with VS Code's macOS default 1.5 line
