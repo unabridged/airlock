@@ -88,13 +88,14 @@ function instanceLabelPill(instanceLabel) {
 }
 
 // The approval page: a header row (the instance pill of a non-production
-// instance, the target badge, and the requesting Claude Code session name or
-// the action question) above the colorized command, above a footer the
-// page owns — a note slot that the helper's native text field overlays
-// (WKWebView inputs cannot take dictation or paste in a non-activating
-// panel), a Deny button carrying the auto-deny countdown, and a split
-// Approve button whose 👀 segment also opens the terminal on the session.
-// All decisions post through {window.webkit.messageHandlers.decision}.
+// instance, the target badge, and the launcher's label for the requesting
+// session — or the action question, when it named no one) above the
+// colorized command, above a footer the page owns — a note slot that the
+// helper's native text field overlays (WKWebView inputs cannot take
+// dictation or paste in a non-activating panel), a Deny button carrying the
+// auto-deny countdown, and a split Approve button whose 👀 segment also opens
+// the terminal on the session. All decisions post through
+// {window.webkit.messageHandlers.decision}.
 export async function buildApprovalHtml({
   command,
   badge,

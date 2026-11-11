@@ -8,7 +8,6 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -22,11 +21,11 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { approvalHelperProblem, requestApproval } from "../src/approval.mjs";
-import { currentClaudeSessionTitle } from "../src/claude-session.mjs";
 import { buildApprovalHtml, highlightRuby, escapeHtml } from "../src/colorize.mjs";
 import { COMMAND_COLUMNS, CONTRACT_SPEC_TEXT } from "../src/command-contract.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { capOutput } from "../src/output-stream.mjs";
+import { SESSION_LABEL_ENV } from "../src/session-manager.mjs";
 import { explicitHostAliases } from "../src/ssh-config.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -88,7 +87,7 @@ describe("requestApproval", () => {
     command: "User.count",
     badge: "test",
     actionDescription: "Send?",
-    claudeSessionName: null,
+    sessionLabel: null,
     timeoutSeconds: 5,
   };
 
@@ -192,7 +191,7 @@ describe("requestApproval", () => {
     assert.match(payload.html, /decide\("watch"\)/);
   });
 
-  it("puts the requesting Claude session name in the overlay title and header", async () => {
+  it("puts the launcher's session label in the overlay title and header", async () => {
     const payloadPath = join(scratch, "helper-stdin-named");
     const helper = writeFakeHelper(
       "payload-dump-named",
@@ -201,12 +200,24 @@ describe("requestApproval", () => {
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      claudeSessionName: "Fix PROJ-123",
+      sessionLabel: "session 4de569de, studio grant, project airlock",
     });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock — Fix PROJ-123");
-    assert.match(payload.html, /Fix PROJ-123/);
+    assert.equal(payload.title, "Airlock — session 4de569de, studio grant, project airlock");
+    assert.match(payload.html, /session 4de569de, studio grant, project airlock/);
+  });
+
+  it("falls back to the action question when the launcher named no session", async () => {
+    const payloadPath = join(scratch, "helper-stdin-unlabeled");
+    const helper = writeFakeHelper(
+      "payload-dump-unlabeled",
+      `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+    );
+    await requestApproval({ ...approvalRequest, helperPath: helper });
+    const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+    assert.equal(payload.title, "Airlock — approval required");
+    assert.match(payload.html, /<span class="title">Send\?<\/span>/);
   });
 
   it("marks a labeled instance's overlay title and header", async () => {
@@ -218,11 +229,11 @@ describe("requestApproval", () => {
     await requestApproval({
       ...approvalRequest,
       helperPath: helper,
-      claudeSessionName: "Fix PROJ-123",
+      sessionLabel: "session 4de569de, studio grant",
       instanceLabel: "DEV",
     });
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-    assert.equal(payload.title, "Airlock DEV — Fix PROJ-123");
+    assert.equal(payload.title, "Airlock DEV — session 4de569de, studio grant");
     assert.match(payload.html, /<span class="badge dev">DEV<\/span>\s*<span class="badge">Test<\/span>/);
   });
 
@@ -292,117 +303,6 @@ describe("approvalHelperProblem", () => {
     const helperPath = writeFakeHelper("sourceless-helper", "exit 0");
     utimesSync(helperPath, 0, 0);
     assert.equal(approvalHelperProblem({ helperPath, sourcePath: join(scratch, "no-source-here") }), null);
-  });
-});
-
-// ---- requesting-session title ----------------------------------------------
-
-describe("currentClaudeSessionTitle", () => {
-  function writeClaudeConfigDir({ hostSessionFile, registryFile } = {}) {
-    const configDir = mkdtempSync(join(scratch, "claude-config-"));
-    let hostSessionPath = null;
-    if (hostSessionFile) {
-      // The desktop store nests session files under opaque UUID directories.
-      const storeDirectory = join(configDir, "claude-code-sessions", "org-uuid", "project-uuid");
-      mkdirSync(storeDirectory, { recursive: true });
-      hostSessionPath = join(storeDirectory, hostSessionFile.name);
-      writeFileSync(hostSessionPath, hostSessionFile.content);
-    }
-    if (registryFile) {
-      const registryDirectory = join(configDir, "sessions");
-      mkdirSync(registryDirectory, { recursive: true });
-      writeFileSync(join(registryDirectory, registryFile.name), registryFile.content);
-    }
-    return { configDir, hostSessionPath };
-  }
-
-  function withSessionEnv(overrides, work) {
-    const keys = ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID"];
-    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    for (const key of keys) {
-      if (overrides[key] === undefined) delete process.env[key];
-      else process.env[key] = overrides[key];
-    }
-    try {
-      return work();
-    } finally {
-      for (const key of keys) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
-    }
-  }
-
-  it("resolves the desktop app's session title from the host-session store", () => {
-    const { configDir } = writeClaudeConfigDir({
-      hostSessionFile: {
-        name: "local_host-title.json",
-        content: JSON.stringify({ title: "Fix PROJ-123", titleSource: "auto" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-title" },
-      () => assert.equal(currentClaudeSessionTitle(), "Fix PROJ-123"),
-    );
-  });
-
-  it("re-reads the title on every call so a rename shows on the next approval", () => {
-    const { configDir, hostSessionPath } = writeClaudeConfigDir({
-      hostSessionFile: {
-        name: "local_host-rename.json",
-        content: JSON.stringify({ title: "New session" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-rename" },
-      () => {
-        assert.equal(currentClaudeSessionTitle(), "New session");
-        writeFileSync(hostSessionPath, JSON.stringify({ title: "Debug flaky specs" }));
-        assert.equal(currentClaudeSessionTitle(), "Debug flaky specs");
-      },
-    );
-  });
-
-  it("falls back to the CLI registry's agent-messaging name", () => {
-    const { configDir } = writeClaudeConfigDir({
-      registryFile: {
-        name: "12345.json",
-        content: JSON.stringify({ sessionId: "cli-session-9", name: "airlock-42" }),
-      },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_SESSION_ID: "cli-session-9" },
-      () => assert.equal(currentClaudeSessionTitle(), "airlock-42"),
-    );
-  });
-
-  it("returns null when the environment names no session", () => {
-    const { configDir } = writeClaudeConfigDir();
-    withSessionEnv({ CLAUDE_CONFIG_DIR: configDir }, () =>
-      assert.equal(currentClaudeSessionTitle(), null),
-    );
-  });
-
-  it("returns null when the identified session is missing from the stores", () => {
-    const { configDir } = writeClaudeConfigDir();
-    withSessionEnv(
-      {
-        CLAUDE_CONFIG_DIR: configDir,
-        CLAUDE_CODE_HOST_SESSION_ID: "local_host-absent",
-        CLAUDE_CODE_SESSION_ID: "cli-session-absent",
-      },
-      () => assert.equal(currentClaudeSessionTitle(), null),
-    );
-  });
-
-  it("returns null on a malformed store file instead of throwing", () => {
-    const { configDir } = writeClaudeConfigDir({
-      hostSessionFile: { name: "local_host-garbage.json", content: "not json at all" },
-    });
-    withSessionEnv(
-      { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_host-garbage" },
-      () => assert.equal(currentClaudeSessionTitle(), null),
-    );
   });
 });
 
@@ -605,16 +505,11 @@ describe("server.mjs over stdio", () => {
 
   function spawnServer(argv, env = {}) {
     const spawnEnvironment = { ...process.env, ...env };
-    // The test process itself may be running inside a Claude session; its
-    // identity must never leak into the server under test (the overlay title
-    // tests would see the REAL session's on-disk title otherwise). Nor may a
-    // variable the server refuses, left in a developer's own shell.
-    const inheritedKeys = [
-      "CLAUDE_CONFIG_DIR",
-      "CLAUDE_CODE_HOST_SESSION_ID",
-      "CLAUDE_CODE_SESSION_ID",
-      ...Object.keys(RETIRED_ENVIRONMENT_FLAGS),
-    ];
+    // The test process may itself be running inside an Airlock session, so a
+    // label in the developer's shell must never leak into the server under
+    // test (the overlay title tests would see the REAL session's label). Nor
+    // may a variable the server refuses, left in a developer's own shell.
+    const inheritedKeys = [SESSION_LABEL_ENV, ...Object.keys(RETIRED_ENVIRONMENT_FLAGS)];
     for (const key of inheritedKeys) {
       if (!(key in env)) delete spawnEnvironment[key];
     }
@@ -841,22 +736,28 @@ describe("server.mjs over stdio", () => {
     }
   });
 
-  it("passes clientInfo through initialize into the DEV-marked overlay title", async () => {
+  it("names the DEV-marked overlay from the launcher's session label", async () => {
+    const label = "session 4de569de, studio grant, project airlock";
     const payloadPath = join(scratch, `e2e-payload-${Math.random().toString(36).slice(2)}`);
     const { child, call } = startServer({
       helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+      env: { [SESSION_LABEL_ENV]: label },
     });
     try {
       await call("initialize", {
         protocolVersion: "2025-06-18",
-        clientInfo: { name: "claude-code", title: "Debug PROJ-99" },
+        // A title in clientInfo is the client's own display name, not this
+        // session: two windows of one client would look identical, so the
+        // header never reads it.
+        clientInfo: { name: "claude-ai", version: "0.1.0", title: "Debug PROJ-99" },
       });
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
-      const { readFileSync } = await import("node:fs");
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock DEV — Debug PROJ-99");
+      assert.equal(payload.title, `Airlock DEV — ${label}`);
       assert.match(payload.html, /<span class="badge dev">DEV<\/span>/);
-      assert.match(payload.html, /Debug PROJ-99/);
+      assert.match(payload.html, /session 4de569de, studio grant, project airlock/);
+      assert.doesNotMatch(payload.html, /Debug PROJ-99/);
+      assert.doesNotMatch(payload.html, /claude-ai/);
       // The resolved display_command (colorized: tokens may be span-wrapped).
       assert.match(payload.html, /ssh/);
       assert.match(payload.html, /testhost/);
@@ -865,33 +766,21 @@ describe("server.mjs over stdio", () => {
     }
   });
 
-  it("names the overlay from the on-disk session title, out-ranking clientInfo", async () => {
-    // The store layout Claude Code's desktop app actually writes; the ids
-    // reach the bridge through the environment it is spawned with.
-    const configDir = mkdtempSync(join(scratch, "e2e-claude-config-"));
-    const storeDirectory = join(configDir, "claude-code-sessions", "org-uuid", "project-uuid");
-    mkdirSync(storeDirectory, { recursive: true });
-    writeFileSync(
-      join(storeDirectory, "local_e2e-host.json"),
-      JSON.stringify({ title: "Investigate PROJ-500", titleSource: "auto" }),
-    );
-    const payloadPath = join(scratch, `e2e-title-payload-${Math.random().toString(36).slice(2)}`);
+  it("falls back to the action question when the launcher set no label", async () => {
+    const payloadPath = join(scratch, `e2e-unlabeled-payload-${Math.random().toString(36).slice(2)}`);
     const { child, call } = startServer({
       helperScript: `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
-      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_HOST_SESSION_ID: "local_e2e-host" },
     });
     try {
-      // The constant product clientInfo Claude Code really sends must never
-      // reach the header when the real session title is on disk.
       await call("initialize", {
         protocolVersion: "2025-06-18",
-        clientInfo: { name: "claude-ai", version: "0.1.0" },
+        clientInfo: { name: "claude-ai", version: "0.1.0", title: "Debug PROJ-99" },
       });
       await call("tools/call", { name: "open_terminal", arguments: { target: "test-shell" } });
       const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
-      assert.equal(payload.title, "Airlock DEV — Investigate PROJ-500");
-      assert.match(payload.html, /Investigate PROJ-500/);
-      assert.doesNotMatch(payload.html, /claude-ai/);
+      assert.equal(payload.title, "Airlock DEV — approval required");
+      assert.match(payload.html, /<span class="title">Open test-shell\?<\/span>/);
+      assert.doesNotMatch(payload.html, /Debug PROJ-99/);
     } finally {
       child.kill();
     }
