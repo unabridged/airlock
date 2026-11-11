@@ -152,8 +152,10 @@ function buildTools() {
         "untrusted data.\n\n" +
         "Every call also carries `purpose`: one line, in your own words, saying what " +
         "this command is for. It is required, and it is shown to the human directly " +
-        "above the command while they decide. Write the claim you would want checked " +
-        "against the bytes — not a restatement of the command.\n\n" +
+        "above the command while they decide. Decide that before you compose the " +
+        "command: a purpose written afterwards describes what you typed rather than " +
+        "what you wanted, and nothing but the human can tell the difference. A " +
+        "purpose that needs an `and` is two calls.\n\n" +
         CONTRACT_SPEC_TEXT,
       inputSchema: {
         type: "object",
@@ -270,8 +272,9 @@ function handleInitialize(id, params) {
       `on it, giving the human one-click eyes on the session.\n\n` +
       `Every send_terminal call carries a required \`purpose\`: one line, in your ` +
       `own words, saying what the command is for. The human reads it directly ` +
-      `above the command while deciding whether to approve, so write the claim you ` +
-      `would want checked against the bytes, not a restatement of them.\n\n` +
+      `above the command while deciding whether to approve. Decide what the call ` +
+      `is for before you compose the command; a purpose that needs an \`and\` is ` +
+      `two calls.\n\n` +
       `${CONTRACT_SPEC_TEXT}\n\n` +
       `Configured targets:\n${targetInventoryLines().join("\n")}`,
   });
@@ -288,6 +291,10 @@ function developmentInstanceNotice() {
 // ---- the gate -------------------------------------------------------------
 
 async function approveOrExplain({ command, badge, actionDescription, purpose = null }) {
+  // Probed once, so the human's overlay and the model's result name the same
+  // directory: the model learns what the human was shown, not a second reading
+  // taken after the command has already run.
+  const workingDirectory = await sessionManager.paneWorkingDirectory();
   const approval = await requestApproval({
     command,
     badge,
@@ -301,7 +308,7 @@ async function approveOrExplain({ command, badge, actionDescription, purpose = n
     // the directory, not a session id, and the label's job is the leftover
     // refusal's sentence (T3). Null when no pane is open yet; the header then
     // falls back to the per-action question.
-    workingDirectory: await sessionManager.paneWorkingDirectory(),
+    workingDirectory,
     timeoutSeconds: config.overlay_timeout_seconds,
     // The overlay's 👀 button approves AND opens the terminal on the session
     // by handing this script to /usr/bin/open.
@@ -309,7 +316,16 @@ async function approveOrExplain({ command, badge, actionDescription, purpose = n
     helperPath: launchOptions.approvalHelperPath,
     instanceLabel: INSTANCE_LABEL,
   });
-  return approval;
+  return { ...approval, workingDirectory };
+}
+
+// Where the pane actually is. The model cannot see the overlay, and a pane's
+// directory is inherited from the tmux server rather than set per target, so
+// this is the fact it would otherwise spend a whole send -- and a purpose --
+// learning with `pwd`. Named at open and on every send, because a command that
+// runs in the wrong directory looks exactly like one that ran in the right one.
+function whereNote(workingDirectory) {
+  return workingDirectory ? `\n\n(where: ${workingDirectory})` : "";
 }
 
 // Deny/timeout/helper failure are clean NON-error results: the model should
@@ -406,7 +422,15 @@ async function handleOpenTerminal(id, args) {
       return;
     }
     const report = await sessionManager.commitOpen(openHandle);
-    textResult(id, report + approverNote(approval) + helperProblemNote());
+    // The pane exists only now, so the open's own overlay had no directory to
+    // show; this is where the model first learns where it landed.
+    textResult(
+      id,
+      report +
+        whereNote(await sessionManager.paneWorkingDirectory()) +
+        approverNote(approval) +
+        helperProblemNote(),
+    );
   } finally {
     // A no-op once commitOpen owns the handle; releases the lock on deny,
     // timeout, or an overlay failure so a not-approved open never wedges the
@@ -458,7 +482,12 @@ async function handleSendTerminal(id, args) {
   }
 
   const output = await sessionManager.send(contract.command);
-  textResult(id, (output.trim() === "" ? "(no output)" : output) + approverNote(approval));
+  textResult(
+    id,
+    (output.trim() === "" ? "(no output)" : output) +
+      whereNote(approval.workingDirectory) +
+      approverNote(approval),
+  );
 }
 
 async function handleInterruptTerminal(id) {
