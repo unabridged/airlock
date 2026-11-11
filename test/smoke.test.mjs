@@ -212,6 +212,9 @@ describe("requestApproval", () => {
       payload.html,
       /<div class="purpose"><span class="key">for<\/span>check whether the staging queue is draining<\/div>/,
     );
+    // The mark: a rule in the gutter, so the claim is set off from the bytes
+    // without becoming louder than them.
+    assert.match(payload.html, /\.purpose \{[^}]*border-left: 3px solid/);
     // The directory is the place; the action question does not repeat it.
     assert.doesNotMatch(payload.html, /<span class="title">Send\?<\/span>/);
   });
