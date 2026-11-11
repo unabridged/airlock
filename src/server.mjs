@@ -409,7 +409,7 @@ async function handleSendTerminal(id, args) {
   }
   const targetKey = sessionManager.activeTargetKey;
   if (!targetKey) {
-    textResult(id, "No session is open. Use open_terminal first.", { isError: true });
+    textResult(id, sessionManager.noSessionRefusal(), { isError: true });
     return;
   }
   // The contract runs before the gate: a rejected command never spawns the
@@ -440,7 +440,7 @@ async function handleSendTerminal(id, args) {
 async function handleInterruptTerminal(id) {
   const targetKey = sessionManager.activeTargetKey;
   if (!targetKey) {
-    textResult(id, "No session is open. Use open_terminal first.", { isError: true });
+    textResult(id, sessionManager.noSessionRefusal(), { isError: true });
     return;
   }
   const approval = await approveOrExplain({
@@ -462,7 +462,7 @@ async function handleInterruptTerminal(id) {
 async function handleCloseTerminal(id) {
   const targetKey = sessionManager.activeTargetKey;
   if (!targetKey) {
-    textResult(id, "No session is open.", { isError: true });
+    textResult(id, sessionManager.noSessionRefusal(), { isError: true });
     return;
   }
   const report = await sessionManager.close();

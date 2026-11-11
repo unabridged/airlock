@@ -124,6 +124,7 @@ function buildSessionManager({
   stateDirectory,
   buildLaunchArgv = () => ["/usr/bin/true"],
   launcherContext = null,
+  livenessProbeMs,
 }) {
   const config = {
     sshConfigPath: "/dev/null",
@@ -149,6 +150,8 @@ function buildSessionManager({
     // The launch seam: unit tests never build a real launch argv at all.
     buildLaunchArgv,
     launcherContext,
+    // Undefined keeps the real interval; the probe's own test drives it.
+    ...(livenessProbeMs === undefined ? {} : { livenessProbeMs }),
   });
 }
 
@@ -901,6 +904,67 @@ describe("SessionManager — liveness probes and teardown safety", () => {
     assertLockHeld();
     tmux.hasSession = realHasSession; // probe recovers → the session still works
     assert.equal(await sessionManager.send("echo hi"), "");
+  });
+
+  it("releases the lock when the pane dies, with no tool call to notice it", async () => {
+    const tmux = new FakeShellTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    await sessionManager.open("fake-shell");
+    assertLockHeld();
+    tmux.alive = false; // the human closed the pane, or the connection dropped
+    await sessionManager.probeLiveness();
+    assert.equal(sessionManager.activeTargetKey, null);
+    // The lock is free: another bridge may open without touching this one.
+    acquireSessionLock(stateDirectory)();
+    // The record is gone too, so the next session sees no leftover.
+    assert.equal(existsSync(join(stateDirectory, "session.json")), false);
+    // And the next call says what happened, rather than "no session is open".
+    await assert.rejects(sessionManager.send("pwd"), /fake-shell session has ended/);
+    // Once. After that the plain refusal returns, so a bridge does not keep
+    // announcing a death from hours ago.
+    await assert.rejects(sessionManager.send("pwd"), /No session is open/);
+  });
+
+  it("reaps on the timer, within the interval, without anyone asking", async () => {
+    const tmux = new FakeShellTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory, livenessProbeMs: 20 });
+    await sessionManager.open("fake-shell");
+    tmux.alive = false;
+    await sleep(120);
+    assert.equal(sessionManager.activeTargetKey, null);
+    acquireSessionLock(stateDirectory)();
+  });
+
+  it("keeps the lock when the probe itself cannot verify the session", async () => {
+    const tmux = new FakeShellTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    await sessionManager.open("fake-shell");
+    tmux.hasSession = async () => {
+      throw new Error("tmux probe exploded");
+    };
+    await sessionManager.probeLiveness(); // must neither reap nor throw
+    assert.equal(sessionManager.activeTargetKey, "fake-shell");
+    assertLockHeld();
+  });
+
+  it("leaves the session alone while a command is in flight", async () => {
+    const tmux = new FakeShellTmux({ outputDelayMs: 80, respond: () => ["done"] });
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    await sessionManager.open("fake-shell");
+    const inFlight = sessionManager.send("echo hi");
+    await sessionManager.probeLiveness(); // a busy pane is not a gone pane
+    assert.equal(sessionManager.activeTargetKey, "fake-shell");
+    assertLockHeld();
+    await inFlight;
+  });
+
+  it("stops the probe when the session closes", async () => {
+    const tmux = new FakeShellTmux();
+    const sessionManager = buildSessionManager({ tmux, stateDirectory });
+    await sessionManager.open("fake-shell");
+    assert.notEqual(sessionManager.livenessTimer, null);
+    await sessionManager.close();
+    assert.equal(sessionManager.livenessTimer, null);
   });
 
   it("interrupt on a dead pane reports the death but never reaps or frees the lock", async () => {

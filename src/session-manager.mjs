@@ -86,6 +86,14 @@ const O_SHLOCK = 0x10;
 const LOCK_ACQUIRE_ATTEMPTS = 25;
 const LOCK_ACQUIRE_RETRY_MS = 8;
 
+// How often an open session asks tmux whether its pane is still there (T11).
+// The cost is one `has-session` per interval per open bridge -- a few
+// milliseconds, on a timer that never holds the process alive. The benefit is
+// that a dead pane frees the cross-bridge lock without a caller: without it, a
+// bridge whose client is gone holds the lock until someone kills the process,
+// and every other session is refused in the meantime.
+const LIVENESS_PROBE_INTERVAL_MS = 10_000;
+
 // {acquireSessionLock} runs synchronously inside the open handshake, so its
 // retry pauses must be synchronous too (a blocked event loop for ≤200ms,
 // only while another bridge's probe collides).
@@ -236,6 +244,7 @@ export class SessionManager {
     buildLaunchArgv: launchArgvBuilder = buildLaunchArgv,
     attachCommandLine = DEFAULT_ATTACH_COMMAND_LINE,
     launcherContext = null,
+    livenessProbeMs = LIVENESS_PROBE_INTERVAL_MS,
   }) {
     this.config = config;
     this.tmux = tmux;
@@ -250,6 +259,11 @@ export class SessionManager {
     this.pendingOperation = null;
     this.pendingOperationName = null;
     this.inFlightAbortState = null;
+    this.livenessProbeMs = livenessProbeMs;
+    this.livenessTimer = null;
+    // The reason a session ended without a caller asking for it, so the next
+    // tool call can say what happened instead of "no session is open".
+    this.reapedSession = null;
     this.timeouts = {
       openMs: config.open_timeout_seconds * 1000,
       commandMs: config.command_timeout_seconds * 1000,
@@ -415,6 +429,8 @@ export class SessionManager {
         }
 
         this.activeSession = { targetKey, target, driver, releaseSessionLock };
+        this.reapedSession = null;
+        this.startLivenessProbe();
         // The result carries no socket path, session id, or tmux syntax (PLAN:
         // goal 5 / output capture) — only the attach command line, which
         // encapsulates all of those.
@@ -763,6 +779,7 @@ export class SessionManager {
         // Graceful or not, the tmux session must be gone when close returns.
         await this.tmux.killSession();
       }
+      this.stopLivenessProbe();
       this.activeSession = null;
       rmSync(this.sessionStateFile, { force: true });
       releaseSessionLock();
@@ -802,6 +819,7 @@ export class SessionManager {
       // The connection dropped (or the human killed the pane): a distinct,
       // terminal error — and the session lock frees so any bridge may open next.
       const { targetKey, releaseSessionLock } = activeSession;
+      this.stopLivenessProbe();
       this.activeSession = null;
       rmSync(this.sessionStateFile, { force: true });
       releaseSessionLock();
@@ -811,10 +829,66 @@ export class SessionManager {
   }
 
   requireOpenSession() {
-    if (!this.activeSession) {
-      throw new SessionStateError(`No session is open. Use open_terminal first.`);
-    }
+    if (!this.activeSession) throw new SessionStateError(this.noSessionRefusal());
     return this.activeSession;
+  }
+
+  // The refusal for a call with no session. A session the probe reaped says
+  // what happened -- once. After that the plain refusal returns, so a bridge
+  // does not keep announcing a death from hours ago. The server's handlers
+  // call this directly too: they refuse before reaching requireOpenSession.
+  noSessionRefusal() {
+    const reaped = this.reapedSession;
+    this.reapedSession = null;
+    return reaped ?? `No session is open. Use open_terminal first.`;
+  }
+
+  // The release that does not need a caller (T11). A live bridge whose pane is
+  // gone keeps the cross-bridge lock until its next tool call -- and a bridge
+  // whose client has gone never makes one, so a leftover pane can refuse every
+  // other session for hours. This asks tmux directly, on a timer, while a
+  // session is open.
+  startLivenessProbe() {
+    this.stopLivenessProbe();
+    const timer = setInterval(() => {
+      void this.probeLiveness();
+    }, this.livenessProbeMs);
+    // The probe must never be the reason the process stays alive; the bridge's
+    // stdin is. (An unref'd timer also cannot keep a test process hanging.)
+    timer.unref?.();
+    this.livenessTimer = timer;
+  }
+
+  stopLivenessProbe() {
+    if (!this.livenessTimer) return;
+    clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
+  }
+
+  // Two rules, both from the probe's own failure modes. An unverifiable
+  // session is never a dead one: {sessionDefinitivelyDead} throws rather than
+  // guessing, and a throw here leaves the lock exactly where it was. And a
+  // busy pane is not a gone pane: while an operation is in flight the probe
+  // skips, because a send legitimately outlives an interval -- the in-flight
+  // call is already the reaper, from inside the exclusive queue.
+  async probeLiveness() {
+    const activeSession = this.activeSession;
+    if (!activeSession || this.pendingOperation || this.openInFlight) return;
+    let dead;
+    try {
+      dead = await this.sessionDefinitivelyDead();
+    } catch {
+      return;
+    }
+    // Re-read after the await: a close, a reap, or a new open may have settled
+    // while the probe was in flight, and only the session it asked about is
+    // this probe's to end.
+    if (!dead || this.activeSession !== activeSession || this.pendingOperation) return;
+    this.stopLivenessProbe();
+    this.activeSession = null;
+    rmSync(this.sessionStateFile, { force: true });
+    activeSession.releaseSessionLock();
+    this.reapedSession = this.sessionEndedError(activeSession.targetKey).message;
   }
 
   // True/false is tmux's DEFINITIVE answer. A failure of the probe itself
