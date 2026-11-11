@@ -9,7 +9,7 @@
 // of the protocol.
 
 import { closeSync, constants, ftruncateSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRailsIrbDriver } from "./drivers/rails-irb.mjs";
 import { createShellDriver } from "./drivers/shell.mjs";
@@ -183,16 +183,28 @@ function createDriver(target) {
     : createShellDriver();
 }
 
+// The launcher's own words for who held a session, read from a state file that
+// is no longer this bridge's. A record carries one `label`; one written before
+// the label existed is described from its fields, so an old leftover still
+// names itself instead of going anonymous.
+function launcherLabelFromRecord(state) {
+  if (typeof state.label === "string" && state.label !== "") return state.label;
+  const parts = [];
+  if (typeof state.session === "string") parts.push(`session ${state.session}`);
+  if (typeof state.studio === "string") parts.push(`studio ${state.studio}`);
+  if (typeof state.project === "string") parts.push(`project ${state.project}`);
+  if (typeof state.profile === "string") parts.push(`profile ${state.profile}`);
+  return parts.length > 0 ? parts.join(", ") : null;
+}
+
 // "Who and when" for a state file written by a bridge that is no longer here.
 // Times are stored as ISO (UTC) and shown in the reader's local time: the
 // refusal is read by a person, and the issue that asked for this was filed
 // because a UTC timestamp made the other session hard to identify.
 function describeStateHolder(state) {
   const parts = [];
-  if (typeof state.session === "string") parts.push(`session ${state.session}`);
-  if (typeof state.studio === "string") parts.push(`studio ${state.studio}`);
-  if (typeof state.project === "string") parts.push(`project ${state.project}`);
-  if (typeof state.profile === "string") parts.push(`profile ${state.profile}`);
+  const label = launcherLabelFromRecord(state);
+  if (label) parts.push(label);
   if (state.client && typeof state.client.name === "string") {
     parts.push(
       typeof state.client.version === "string" ? `${state.client.name} ${state.client.version}` : state.client.name,
@@ -206,26 +218,28 @@ function describeStateHolder(state) {
   return parts.length > 0 ? `, ${parts.join(", ")}` : "";
 }
 
-// The launcher's name for this session, handed in as plain environment (the
-// concord contract: CONCORD_SESSION, CONCORD_PROFILE, CONCORD_STUDIO). It is
-// not a credential and not part of MCP; it exists so a later session that
-// finds this one's shell still running can say *which* session left it.
-export function launcherContextFromEnv(environment = process.env) {
-  const fields = {
-    session: "CONCORD_SESSION",
-    profile: "CONCORD_PROFILE",
-    studio: "CONCORD_STUDIO",
-  };
-  const context = {};
-  for (const [field, name] of Object.entries(fields)) {
-    const value = environment[name];
-    if (typeof value === "string" && value.trim() !== "") context[field] = value.trim();
-  }
-  // The project is the human-findable part: a session id and a studio still
-  // do not tell a person which tab to look in, but the checkout's name does.
-  const root = environment.CONCORD_ROOT;
-  if (typeof root === "string" && root.trim() !== "") context.project = basename(root.trim());
-  return Object.keys(context).length > 0 ? context : null;
+// The launcher's label for this session: one plain, non-secret line naming who
+// is asking -- "session 4de569de, studio grant, project concord", a person's
+// name, or nothing at all. One generic variable on purpose: Airlock serves any
+// harness, and a bridge that only understands one launcher's names cannot name
+// the sessions it exists to name (T1). What Airlock observes for itself -- the
+// MCP client, the bridge pid, the open time -- is recorded beside it.
+export const SESSION_LABEL_ENV = "AIRLOCK_SESSION_LABEL";
+const MAX_SESSION_LABEL_CHARS = 120;
+
+export function sessionLabelFromEnv(environment = process.env) {
+  const raw = environment[SESSION_LABEL_ENV];
+  if (typeof raw !== "string") return null;
+  // The label is written into a state file and printed in a refusal a person
+  // reads: one line, no control characters, short enough that it cannot become
+  // the wall it is meant to save them from.
+  const label = raw
+    .replace(/[\t\n\r]/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SESSION_LABEL_CHARS);
+  return label === "" ? null : label;
 }
 
 export class SessionManager {
@@ -235,7 +249,7 @@ export class SessionManager {
     tmux = new Tmux({ socketPath: join(stateDirectory, "tmux.sock") }),
     buildLaunchArgv: launchArgvBuilder = buildLaunchArgv,
     attachCommandLine = DEFAULT_ATTACH_COMMAND_LINE,
-    launcherContext = null,
+    sessionLabel = null,
   }) {
     this.config = config;
     this.tmux = tmux;
@@ -245,7 +259,7 @@ export class SessionManager {
     this.sessionStateFile = join(stateDirectory, "session.json");
     this.activeSession = null;
     this.clientInfo = null;
-    this.launcherContext = launcherContext;
+    this.sessionLabel = sessionLabel;
     this.openInFlight = false;
     this.pendingOperation = null;
     this.pendingOperationName = null;
@@ -375,9 +389,11 @@ export class SessionManager {
           const openedAt =
             typeof recorded?.opened_at === "string" ? recorded.opened_at : new Date().toISOString();
           const client = recorded?.client ?? this.clientInfo;
-          // A fresh open records this launcher's naming; an adopt keeps the
+          // A fresh open records this launcher's label; an adopt keeps the
           // opener's and only marks itself.
-          const naming = adopt ? { adopted: true } : this.launcherContext;
+          let naming = {};
+          if (adopt) naming = { adopted: true };
+          else if (this.sessionLabel) naming = { label: this.sessionLabel };
           replaceFile(
             this.sessionStateFile,
             JSON.stringify({
@@ -456,10 +472,7 @@ export class SessionManager {
           pid: holder.pid,
           target: state.target,
           opened_at: state.opened_at,
-          ...(typeof state.session === "string" ? { session: state.session } : {}),
-          ...(typeof state.profile === "string" ? { profile: state.profile } : {}),
-          ...(typeof state.studio === "string" ? { studio: state.studio } : {}),
-          ...(typeof state.project === "string" ? { project: state.project } : {}),
+          ...(launcherLabelFromRecord(state) ? { label: launcherLabelFromRecord(state) } : {}),
           ...(state.client && typeof state.client === "object" ? { client: state.client } : {}),
         };
       }
@@ -548,6 +561,21 @@ export class SessionManager {
         `open_terminal with target ${recorded.target} adopts it as recorded, or ` +
         `clear_terminal ends it. If the record is stale, clear it and open afresh.`,
     );
+  }
+
+  // The directory the open pane is in, for the approval header: an approved
+  // command runs there, and a person tells their sessions apart by project
+  // and directory rather than by session id (T3). Best-effort by the same
+  // contract as {leftoverPaneTail}: an approval must never fail because the
+  // header could not be filled in, and a bridge with no session has nothing
+  // to report.
+  async paneWorkingDirectory() {
+    if (!this.activeSession) return null;
+    try {
+      return await this.tmux.paneCurrentPath();
+    } catch {
+      return null;
+    }
   }
 
   // The last few lines of the leftover pane, for the adopt overlay: the one

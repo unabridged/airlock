@@ -54,6 +54,28 @@ Agent sees six tools:
 Deny can carry a feedback note, which rides back to the agent so it can adjust 
 and resend.
 
+**Naming the holder.** A refusal says which session holds the gate, and it can
+only say what the launcher tells it. If the launcher sets
+`AIRLOCK_SESSION_LABEL` — one plain, non-secret line, such as
+`session 4de569de, studio grant, project concord` — that is what a refusal and
+`list_targets` show. A client that starts the server itself sets it the same
+way, in the server's `env` block:
+
+```json
+"airlock": {
+  "command": "…",
+  "env": { "AIRLOCK_SESSION_LABEL": "staging console — deploy check" }
+}
+```
+
+The MCP client's own name is not enough: it identifies the product (`claude-ai`,
+`pi`), not the session, so two windows of the same client look identical in a
+refusal. The label is what makes the holder findable. It is one generic variable
+rather than any one launcher's set, so a session started by any harness can name
+itself; without it the record still carries the MCP client, the bridge pid, and
+the open time, and an older `session.json` is still described from its own
+fields.
+
 **Style contract:** `send_terminal` checks every command against a style
 contract before the overlay pops, so the human only reviews text they can read
 at a glance. The overlay shows every approved byte at 80 columns without a

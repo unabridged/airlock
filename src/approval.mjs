@@ -65,7 +65,8 @@ process.on("exit", () => {
 // Resolves to { approved, decision, message } — it never rejects; every
 // failure mode is a non-approval with a decision label. `helperPath` is the
 // overlay executable the launch options chose; `instanceLabel` (such as
-// "DEV") marks the panel of a non-production instance.
+// "DEV") marks the panel of a non-production instance; `workingDirectory` is
+// the pane's current directory, or null when no pane is open to ask.
 export function requestApproval(request) {
   const queuedRequest = overlayQueue.then(() => presentOverlay(request));
   // The queue must survive any outcome; presentOverlay never rejects anyway.
@@ -80,7 +81,7 @@ async function presentOverlay({
   command,
   badge,
   actionDescription,
-  claudeSessionName,
+  workingDirectory,
   timeoutSeconds,
   watchCommandPath,
   helperPath,
@@ -90,12 +91,16 @@ async function presentOverlay({
     command,
     badge,
     instanceLabel,
-    // The header carries the requesting Claude Code session's name when the
-    // server learned it, falling back to the action question.
-    headerText: claudeSessionName || actionDescription,
+    // The header carries where the command would run, falling back to the
+    // action question when there is no pane yet. The command is the one thing
+    // the human can already see; the header is the sentence around it.
+    headerText: actionDescription,
+    workingDirectory,
     timeoutSeconds,
   });
-  const title = `${overlayTitlePrefix(instanceLabel)} — ${claudeSessionName || "approval required"}`;
+  // The window title is what a window list shows: the target, which is the
+  // only stable answer to "which panel is this".
+  const title = `${overlayTitlePrefix(instanceLabel)} — ${badge}`;
 
   return new Promise((resolve) => {
     let settled = false;

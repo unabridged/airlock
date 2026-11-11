@@ -82,24 +82,35 @@ function humanizeBadge(badge) {
 
 // The pill naming a non-production instance, ahead of the target badge so a
 // development panel is never mistaken for the production gate.
+// The header's last slot. The directory, when a pane is open to ask: a person
+// with one session per project knows their sessions by the directory they are
+// in, not by a session id. Without a pane there is nothing honest to show
+// about where, so the action question stands in.
+function whereSpan(workingDirectory, headerText) {
+  if (workingDirectory) return `<span class="where">${escapeHtml(workingDirectory)}</span>`;
+  return `<span class="title">${escapeHtml(headerText)}</span>`;
+}
+
 function instanceLabelPill(instanceLabel) {
   if (!instanceLabel) return "";
   return `<span class="badge dev">${escapeHtml(instanceLabel)}</span>`;
 }
 
 // The approval page: a header row (the instance pill of a non-production
-// instance, the target badge, and the requesting Claude Code session name or
-// the action question) above the colorized command, above a footer the
-// page owns — a note slot that the helper's native text field overlays
-// (WKWebView inputs cannot take dictation or paste in a non-activating
-// panel), a Deny button carrying the auto-deny countdown, and a split
-// Approve button whose 👀 segment also opens the terminal on the session.
-// All decisions post through {window.webkit.messageHandlers.decision}.
+// instance, the target badge, and the directory an approved command would
+// run in — or the action question, when there is no pane to ask) above the
+// colorized command, above a footer the page owns — a note slot that the
+// helper's native text field overlays (WKWebView inputs cannot take
+// dictation or paste in a non-activating panel), a Deny button carrying the
+// auto-deny countdown, and a split Approve button whose 👀 segment also opens
+// the terminal on the session. All decisions post through
+// {window.webkit.messageHandlers.decision}.
 export async function buildApprovalHtml({
   command,
   badge,
   instanceLabel = null,
   headerText,
+  workingDirectory = null,
   timeoutSeconds,
 }) {
   const lines = (await highlightRuby(command)).split("\n");
@@ -152,6 +163,12 @@ export async function buildApprovalHtml({
   /* A development instance's pill: purple, a tint no target badge uses. */
   .badge.dev { background: #4b3b6b; color: #cfa8ff; }
   .title { color: #d6d9e9; font-size: 18px; font-weight: 510; }
+  /* Where the command would run. A path is not prose: it renders in the
+     command's own face, muted, so it reads as the place rather than as one
+     more sentence to parse. Wraps rather than clipping — the tail of a path
+     is the part that names it. */
+  .where { color: #9aa3bb; font: 400 16px/1.5 Menlo, monospace;
+           overflow-wrap: anywhere; min-width: 0; }
   /* The code block is a positioning context for the more-lines badge. */
   .code { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
   pre { margin: 0; padding: 0 0 5px; overflow: auto; flex: 1 1 auto; min-height: 0; }
@@ -234,7 +251,7 @@ export async function buildApprovalHtml({
 </style></head><body>
   <div class="head">${instanceLabelPill(instanceLabel)}
     <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
-    <span class="title">${escapeHtml(headerText)}</span>
+    ${whereSpan(workingDirectory, headerText)}
   </div>
   <div class="code"><pre>${rows}</pre><span id="more-lines" hidden></span></div>
   <div class="foot">

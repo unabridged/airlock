@@ -21,7 +21,6 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { approvalHelperProblem, requestApproval } from "./approval.mjs";
-import { currentClaudeSessionTitle } from "./claude-session.mjs";
 import {
   checkCommandContract,
   CONTRACT_SPEC_TEXT,
@@ -30,7 +29,7 @@ import {
 import { loadConfig, transportCommandLine } from "./config.mjs";
 import { installationProblems, refusalText } from "./install-check.mjs";
 import { parseLaunchOptions, USAGE_TEXT, UsageError } from "./launch-options.mjs";
-import { isExpectedSessionError, launcherContextFromEnv, SessionManager } from "./session-manager.mjs";
+import { isExpectedSessionError, sessionLabelFromEnv, SessionManager } from "./session-manager.mjs";
 import { Tmux } from "./tmux.mjs";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
@@ -89,20 +88,15 @@ const sessionManager = new SessionManager({
   stateDirectory: launchOptions.stateDirectory,
   tmux: Tmux.forLaunch(launchOptions),
   attachCommandLine: launchOptions.attachCommandLine,
-  // The launcher's name for this session (CONCORD_SESSION/PROFILE/STUDIO),
+  // The launcher's own label for this session (AIRLOCK_SESSION_LABEL),
   // recorded in session.json so a later session can name the holder.
-  launcherContext: launcherContextFromEnv(),
+  sessionLabel: sessionLabelFromEnv(),
 });
 
 // A missing helper is a call-time non-approval by contract, but the
 // misconfiguration should be named at registration time, not mid-workflow.
 const helperProblem = approvalHelperProblem({ helperPath: launchOptions.approvalHelperPath });
 if (helperProblem) log(`warning: ${helperProblem}`);
-
-// Fallback identity for the overlay header, learned from initialize
-// (clientInfo.title) — outranked per-approval by the on-disk session title
-// ({currentClaudeSessionTitle}), outranking the per-action question.
-let claudeSessionName = null;
 
 // ---- tool definitions, generated from config so they cannot drift ---------
 
@@ -239,13 +233,12 @@ function handleInitialize(id, params) {
 
   const clientInfo = params && params.clientInfo;
   if (clientInfo) {
-    // Only the display-intended title is worth keeping. clientInfo.name is a
-    // constant product identifier ("claude-ai") that would displace the far
-    // more useful per-action question in the overlay header.
-    claudeSessionName = (typeof clientInfo.title === "string" && clientInfo.title) || null;
-    // The name and version DO belong in the session state file: a later
+    // The client's name and version belong in the session state file: a later
     // session that finds this one's pane still running needs to say who left
-    // it there.
+    // it there. They do not belong in the overlay header — the name is a
+    // constant product identifier, identical in two windows of one client, so
+    // it cannot answer "which session is asking". The launcher's own label
+    // does that, and it is the only identity the header uses.
     sessionManager.noteClient(clientInfo);
   }
 
@@ -284,10 +277,12 @@ async function approveOrExplain({ command, badge, actionDescription }) {
     command,
     badge,
     actionDescription,
-    // The on-disk session title is resolved fresh per approval — the app
-    // auto-titles a session a few exchanges in, and the human can rename it
-    // at any time — with anything learned from initialize as the fallback.
-    claudeSessionName: currentClaudeSessionTitle() || claudeSessionName,
+    // Where an approved command would run: the pane's directory right now.
+    // Not the launcher's label — a person with one session per project reads
+    // the directory, not a session id, and the label's job is the leftover
+    // refusal's sentence (T3). Null when no pane is open yet; the header then
+    // falls back to the per-action question.
+    workingDirectory: await sessionManager.paneWorkingDirectory(),
     timeoutSeconds: config.overlay_timeout_seconds,
     // The overlay's 👀 button approves AND opens the terminal on the session
     // by handing this script to /usr/bin/open.
@@ -529,10 +524,7 @@ function handleListTargets(id) {
           target: otherSession.target,
           opened_at: otherSession.opened_at,
           bridge_pid: otherSession.pid,
-          ...(otherSession.session ? { session: otherSession.session } : {}),
-          ...(otherSession.profile ? { profile: otherSession.profile } : {}),
-          ...(otherSession.studio ? { studio: otherSession.studio } : {}),
-          ...(otherSession.project ? { project: otherSession.project } : {}),
+          ...(otherSession.label ? { label: otherSession.label } : {}),
         },
         targets: inventory,
       },
