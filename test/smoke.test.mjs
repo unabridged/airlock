@@ -191,7 +191,7 @@ describe("requestApproval", () => {
     assert.match(payload.html, /decide\("watch"\)/);
   });
 
-  it("puts the pane's working directory in the header, and the target in the title", async () => {
+  it("puts the directory and the purpose in the header, and the target in the title", async () => {
     const payloadPath = join(scratch, "helper-stdin-where");
     const helper = writeFakeHelper(
       "payload-dump-where",
@@ -201,13 +201,30 @@ describe("requestApproval", () => {
       ...approvalRequest,
       helperPath: helper,
       workingDirectory: "/srv/app",
+      purpose: "check whether the staging queue is draining",
     });
     const { readFileSync } = await import("node:fs");
     const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
     assert.equal(payload.title, "Airlock — test");
     assert.match(payload.html, /<span class="where">\/srv\/app<\/span>/);
+    // The claim, marked as one: a quiet key, then the model's words.
+    assert.match(
+      payload.html,
+      /<div class="purpose"><span class="key">for<\/span>check whether the staging queue is draining<\/div>/,
+    );
     // The directory is the place; the action question does not repeat it.
     assert.doesNotMatch(payload.html, /<span class="title">Send\?<\/span>/);
+  });
+
+  it("omits the purpose line when the call carries no claim", async () => {
+    const payloadPath = join(scratch, "helper-stdin-no-purpose");
+    const helper = writeFakeHelper(
+      "payload-dump-no-purpose",
+      `cat > ${payloadPath}; printf '{"decision":"deny"}'`,
+    );
+    await requestApproval({ ...approvalRequest, helperPath: helper });
+    const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+    assert.doesNotMatch(payload.html, /class="purpose"/);
   });
 
   it("falls back to the action question when no pane is open to ask", async () => {
@@ -703,7 +720,7 @@ describe("server.mjs over stdio", () => {
 
       const noSession = await call("tools/call", {
         name: "send_terminal",
-        arguments: { command: "pwd" },
+        arguments: { command: "pwd", purpose: "find where the session starts" },
       });
       assert.equal(noSession.result.isError, true);
       assert.match(noSession.result.content[0].text, /No session is open/);
@@ -1093,16 +1110,80 @@ describe("server.mjs over stdio", () => {
 
       const wideCommand = `echo ${"a".repeat(115)}`;
       assert.equal(wideCommand.length, 120);
-      const rejected = await call("tools/call", { name: "send_terminal", arguments: { command: wideCommand } });
+      const rejected = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: wideCommand, purpose: "prove a wide line never reaches the human" },
+      });
       assert.equal(rejected.result.isError, true);
       assert.match(rejected.result.content[0].text, /^send_terminal rejected before approval/);
       assert.match(rejected.result.content[0].text, /line 1, col 81: \[width\] 120 columns; the limit is 80/);
       assert.equal(overlayCount(), 1, "the approval overlay must not have popped");
 
-      const sent = await call("tools/call", { name: "send_terminal", arguments: { command: "echo hello\n" } });
+      const sent = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hello\n", purpose: "prove a well-formed send still goes through" },
+      });
       assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
       assert.match(sent.result.content[0].text, /hello/);
       assert.equal(overlayCount(), 2);
+
+      await call("tools/call", { name: "close_terminal", arguments: {} });
+    } finally {
+      spawnSync(tmuxBinaryForTests(), ["-S", join(stateDirectory, "tmux.sock"), "kill-server"]);
+      child.kill();
+    }
+  });
+
+  it("requires a purpose line, and shows it above the command", async () => {
+    const payloadPath = join(scratch, `e2e-purpose-${Math.random().toString(36).slice(2)}`);
+    const localShellPath = writeFakeHelper(
+      `purpose-shell-${Math.random().toString(36).slice(2)}`,
+      "exec /usr/bin/env LANG=en_US.UTF-8 /bin/bash --norc --noprofile",
+    );
+    const configPath = writeBridgeConfig({
+      targets: {
+        "local-shell": {
+          description: "Local bash standing in for a remote shell",
+          display_command: localShellPath,
+          transport: "script",
+          script: localShellPath,
+          driver: "shell",
+        },
+      },
+    });
+    const { child, call, stateDirectory } = startServer({
+      helperScript: `cat > ${payloadPath}; printf '{"decision":"approve"}'`,
+      configPath,
+    });
+    try {
+      await call("initialize", { protocolVersion: "2025-06-18" });
+      const opened = await call("tools/call", { name: "open_terminal", arguments: { target: "local-shell" } });
+      assert.notEqual(opened.result.isError, true, opened.result.content[0].text);
+
+      // Missing: the tool schema requires it, and the bridge says so without
+      // popping the overlay.
+      const missing = await call("tools/call", { name: "send_terminal", arguments: { command: "echo hi\n" } });
+      assert.equal(missing.result.isError, true);
+      assert.match(missing.result.content[0].text, /`purpose` is required/);
+
+      const tooLong = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hi\n", purpose: "x".repeat(101) },
+      });
+      assert.equal(tooLong.result.isError, true);
+      assert.match(tooLong.result.content[0].text, /101 characters; the limit is 100/);
+
+      const purpose = "check whether the queue is draining";
+      const sent = await call("tools/call", {
+        name: "send_terminal",
+        arguments: { command: "echo hi\n", purpose },
+      });
+      assert.notEqual(sent.result.isError, true, sent.result.content[0].text);
+      const payload = JSON.parse(readFileSync(payloadPath, "utf8"));
+      // The claim, marked as a claim, above the bytes; the directory beside it
+      // is the observed fact it is not.
+      assert.match(payload.html, new RegExp(`<div class="purpose"><span class="key">for</span>${purpose}</div>`));
+      assert.match(payload.html, /<span class="where">/);
 
       await call("tools/call", { name: "close_terminal", arguments: {} });
     } finally {

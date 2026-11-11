@@ -46,7 +46,7 @@ Agent sees six tools:
 | `list_targets` | none | Lists the configured targets (name, description, the exact command an open would run), and which session holds the one open session. |
 | `open_terminal` | overlay | Starts the session for one target: `ssh <alias>`, then the target's startup lines (e.g. `bin/rails console`). |
 | `open_terminal` with `adopt: true` | overlay | Takes over the pane an earlier bridge left running, under the target the state file recorded. Nothing is started; a Rails console gets one idempotent line (the pager-disable check that proves it is IRB). |
-| `send_terminal` | overlay | Types one command into the session and returns the captured output. |
+| `send_terminal` | overlay | Types one command into the session and returns the captured output. Every call carries a required `purpose`: one line saying what the command is for, shown to the human above it. |
 | `interrupt_terminal` | overlay | Sends a real Ctrl-C to the running command. |
 | `close_terminal` | none | Exits the remote program and tears the session down. |
 | `clear_terminal` | overlay | Ends the pane an earlier bridge left running, when the human says it is dead. Never automatic, and never while another live bridge holds it. |
@@ -75,6 +75,21 @@ rather than any one launcher's set, so a session started by any harness can name
 itself; without it the record still carries the MCP client, the bridge pid, and
 the open time, and an older `session.json` is still described from its own
 fields.
+
+**What the overlay shows:** the target, the directory the pane is in right now,
+and the agent's one-line `purpose` for the command — then the command itself,
+verbatim. The directory is a fact the bridge observes; the purpose is the
+agent's own claim about why it is running this, and it is marked as a claim. A
+command with no pane yet (an open) shows the action question instead of a
+directory, and no purpose: those calls carry none.
+
+**Purpose line:** `send_terminal` requires one, because the gate is a
+commitment surface — a sentence the agent must write before the human decides
+costs it something, and a claim made in front of the person approving is one
+they can hold against the bytes. It is one line, at most 100 characters, with
+the same character rules as the command, and it is checked before the overlay
+pops. A missing, paragraph-length, over-long, or unrenderable purpose is
+rejected with the problems listed, and the human never sees the call.
 
 **Style contract:** `send_terminal` checks every command against a style
 contract before the overlay pops, so the human only reviews text they can read

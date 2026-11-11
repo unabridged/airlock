@@ -66,7 +66,9 @@ process.on("exit", () => {
 // failure mode is a non-approval with a decision label. `helperPath` is the
 // overlay executable the launch options chose; `instanceLabel` (such as
 // "DEV") marks the panel of a non-production instance; `workingDirectory` is
-// the pane's current directory, or null when no pane is open to ask.
+// the pane's current directory, or null when no pane is open to ask; `purpose`
+// is the model's one-line claim about why the call exists, or null when the
+// call carries no claim.
 export function requestApproval(request) {
   const queuedRequest = overlayQueue.then(() => presentOverlay(request));
   // The queue must survive any outcome; presentOverlay never rejects anyway.
@@ -82,6 +84,7 @@ async function presentOverlay({
   badge,
   actionDescription,
   workingDirectory,
+  purpose = null,
   timeoutSeconds,
   watchCommandPath,
   helperPath,
@@ -96,6 +99,7 @@ async function presentOverlay({
     // the human can already see; the header is the sentence around it.
     headerText: actionDescription,
     workingDirectory,
+    purpose,
     timeoutSeconds,
   });
   // The window title is what a window list shows: the target, which is the

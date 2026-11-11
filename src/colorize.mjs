@@ -91,6 +91,15 @@ function whereSpan(workingDirectory, headerText) {
   return `<span class="title">${escapeHtml(headerText)}</span>`;
 }
 
+// The line under the header: the model's claim about why this call exists.
+// It reads as a claim on purpose -- a quiet `for` ahead of it, and the words in
+// italic -- because the directory above is a fact the bridge observed and this
+// is not. A person deciding needs to be able to tell those apart at a glance.
+function purposeLine(purpose) {
+  if (!purpose) return "";
+  return `<div class="purpose"><span class="key">for</span>${escapeHtml(purpose)}</div>`;
+}
+
 function instanceLabelPill(instanceLabel) {
   if (!instanceLabel) return "";
   return `<span class="badge dev">${escapeHtml(instanceLabel)}</span>`;
@@ -111,6 +120,7 @@ export async function buildApprovalHtml({
   instanceLabel = null,
   headerText,
   workingDirectory = null,
+  purpose = null,
   timeoutSeconds,
 }) {
   const lines = (await highlightRuby(command)).split("\n");
@@ -149,9 +159,17 @@ export async function buildApprovalHtml({
   /* The header doubles as the window's drag strip — unselectable, so WebKit
      passes its mouse-downs through to AppKit instead of starting a text
      selection. */
-  .head { display: flex; align-items: center; gap: 12px; padding: 18px;
+  .head { display: flex; flex-direction: column; gap: 10px; padding: 18px;
           font-family: -apple-system, system-ui, sans-serif;
           -webkit-user-select: none; user-select: none; }
+  .headline { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  /* The requester's claim, not the bridge's observation: italic, and marked
+     with a quiet key so it is never mistaken for the path above it. */
+  .purpose { color: #c8cde0; font-size: 17px; font-style: italic;
+             overflow-wrap: anywhere; }
+  .purpose .key { color: #7d84a0; font-style: normal; font-size: 12px;
+                  letter-spacing: 0.12em; text-transform: uppercase;
+                  margin-right: 10px; }
   /* ui-rounded resolves to SF Pro Rounded inside WKWebView. */
   .badge { background: #454a59; color: #54b9ff; border-radius: 999px;
            padding: 4px 14px; font: 600 17px/1.5 ui-rounded, -apple-system,
@@ -249,9 +267,12 @@ export async function buildApprovalHtml({
   .glyph { flex: none; }
   button.eyes .glyph { font-size: 17px; line-height: 1; text-shadow: none; }
 </style></head><body>
-  <div class="head">${instanceLabelPill(instanceLabel)}
-    <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
-    ${whereSpan(workingDirectory, headerText)}
+  <div class="head">
+    <div class="headline">${instanceLabelPill(instanceLabel)}
+      <span class="${badgeClass(badge)}">${escapeHtml(humanizeBadge(badge))}</span>
+      ${whereSpan(workingDirectory, headerText)}
+    </div>
+    ${purposeLine(purpose)}
   </div>
   <div class="code"><pre>${rows}</pre><span id="more-lines" hidden></span></div>
   <div class="foot">
